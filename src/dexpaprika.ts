@@ -1,0 +1,125 @@
+import { DexPaprikaClient } from "dexpaprika-sdk";
+import { config } from "./config.ts";
+import { SlidingWindowRateLimiter } from "./rate-limiter.ts";
+
+const limiter = new SlidingWindowRateLimiter(config.dexPaprika.maxRpm);
+
+const client = new DexPaprikaClient(
+  config.dexPaprika.baseUrl,
+  {},
+  {
+    // Documented auth (SDK >= 1.10): sent as the entire Authorization
+    // header value, no scheme prefix. Explicit key beats DEXPAPRIKA_API_KEY.
+    ...(config.dexPaprika.apiKey ? { apiKey: config.dexPaprika.apiKey } : {}),
+    retry: {
+      maxRetries: 3,
+      delaySequenceMs: [250, 750, 1500],
+      retryableStatuses: [408, 429, 500, 502, 503, 504],
+    },
+    // Discovery must stay fresh. The SDK cache defaults to minutes, which
+    // is inappropriate for a new-pool watcher.
+    cache: {
+      enabled: false,
+    },
+  },
+);
+
+interface SearchPoolToken {
+  id?: string;
+  symbol?: string;
+  name?: string;
+}
+
+interface SearchPoolRow {
+  id: string;
+  created_at: string;
+  dex_id?: string;
+  dex_name?: string;
+  volume_usd_24h?: number;
+  liquidity_usd?: number;
+  transactions_24h?: number;
+  tokens?: SearchPoolToken[];
+}
+
+interface SearchResponse {
+  results: SearchPoolRow[];
+  has_next_page?: boolean;
+  next_cursor?: string;
+}
+
+export interface DiscoveredPool {
+  chain: string;
+  poolAddress: string;
+  createdAtMs: number;
+  dexId: string;
+  dexName: string;
+  volume24hUsd: number;
+  liquidityUsd: number;
+  txns24h: number;
+  tokens: Array<{ id: string; symbol: string; name: string }>;
+}
+
+function asFiniteNumber(value: unknown): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+export async function fetchNewestPools(chain: string): Promise<DiscoveredPool[]> {
+  const now = Date.now();
+  const tooOldMs = now - config.dexPaprika.maxAgeSec * 1000;
+  const tooYoungMs = now - config.dexPaprika.minAgeSec * 1000;
+  const rows: SearchPoolRow[] = [];
+  let cursor: string | undefined;
+
+  // The SDK's network-pool endpoint is cursor-paginated. Because we sort by
+  // creation time descending, once a page reaches the lower edge of our age
+  // band, all later pages are older and cannot contain eligible pools.
+  for (let page = 0; page < 10; page++) {
+    await limiter.acquire();
+    const response = await client.pools.listByNetwork(chain, {
+      limit: config.dexPaprika.limit,
+      sort: "desc",
+      orderBy: "created_at",
+      ...(cursor ? { cursor } : {}),
+    }) as unknown as SearchResponse;
+
+    rows.push(...response.results);
+    const oldestMs = response.results.reduce((oldest, pool) => {
+      const created = Date.parse(String(pool.created_at));
+      return Number.isFinite(created) ? Math.min(oldest, created) : oldest;
+    }, Number.POSITIVE_INFINITY);
+
+    if (!response.has_next_page || !response.next_cursor || oldestMs <= tooOldMs) break;
+    cursor = response.next_cursor;
+  }
+
+  return rows
+    .map((pool) => {
+      const createdAtMs = Date.parse(String(pool.created_at));
+      return {
+        chain,
+        poolAddress: String(pool.id),
+        createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : 0,
+        dexId: String(pool.dex_id ?? ""),
+        dexName: String(pool.dex_name ?? pool.dex_id ?? ""),
+        volume24hUsd: asFiniteNumber(pool.volume_usd_24h),
+        liquidityUsd: asFiniteNumber(pool.liquidity_usd),
+        txns24h: asFiniteNumber(pool.transactions_24h),
+        tokens: (pool.tokens ?? []).map((token) => ({
+          id: String(token.id ?? ""),
+          symbol: String(token.symbol ?? ""),
+          name: String(token.name ?? ""),
+        })),
+      } satisfies DiscoveredPool;
+    })
+    .filter((pool) => pool.createdAtMs >= tooOldMs)
+    .filter((pool) => pool.createdAtMs <= tooYoungMs)
+    .filter((pool) => pool.liquidityUsd >= config.dexPaprika.minLiquidityUsd)
+    .filter((pool) => pool.liquidityUsd <= config.dexPaprika.maxLiquidityUsd)
+    .filter((pool) => pool.volume24hUsd >= config.dexPaprika.minVolume24hUsd)
+    .filter((pool) => pool.txns24h >= config.dexPaprika.minTxns24h);
+}
+
+export function getClient(): DexPaprikaClient {
+  return client;
+}

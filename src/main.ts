@@ -1,0 +1,501 @@
+import { config, isEntryPausedAt, RH, robinhoodExitProfile } from "./config.ts";
+import { fetchNewestPools } from "./dexpaprika.ts";
+import { assessConfirmation, getPair, getPairsByChain, parsePrice, pairLiquidityUsd } from "./dexscreener.ts";
+import { openPosition, updatePosition } from "./position.ts";
+import { Portfolio } from "./portfolio.ts";
+import { loadState, saveState } from "./store.ts";
+import {
+  analyticsStatus, closeAnalytics, initAnalytics, recordFill, recordQuoteCheck,
+  recordSnapshot, recordTrade, tradeRecordFromPosition,
+} from "./analytics.ts";
+import { telegram, testTelegram } from "./telegram.ts";
+import { buildBuyMessage, buildCloseMessage, buildStartupMessage, buildTpMessage, buildUpdateMessage } from "./report.ts";
+import type { Candidate, DexScreenerPair, Position } from "./types.ts";
+import type { PositionEvent } from "./position.ts";
+import { recentStopCount, rollingExpectancyNegative, paperLossLimitBreached, isRepeatSymbol } from "./breakers.ts";
+import { claimInstanceLockForStateFile } from "./instance-lock.ts";
+import {
+  liveBuy, liveEntryAllowed, liveOpenCount, initLive, restoredStrategyPositions,
+  pumpLiveSells, queueLiveSell, isLiveSellPending, catchUpLiveSells,
+  syncLiveStrategyState, flushLiveState, getLivePosition, finalizeLivePosition,
+  liveCashUsd, latchHalt, applyConfirmedLiveSell,
+} from "./live.ts";
+import { traderAddress } from "./execution/evm/viem-client.ts";
+import { quote0x } from "./execution/evm/zeroex.ts";
+import { runLiveSmokeTest } from "./live-test.ts";
+
+const CHAIN = RH.chain;
+const positions = new Map<string, Position>();
+const portfolio = new Portfolio(config.portfolio.initialBalanceUsd);
+const seenPools = new Map<string, number>();
+const lastSnapshotAt = new Map<string, number>();
+const ledgerCosts = new Map<string, { fee: number; slip: number }>();
+const pendingConfirms = new Map<string, { candidate: Candidate; firstPrice: number; firstLiquidity: number | null; fireAt: number }>();
+let lastPersist = 0;
+let lastPausedLog = 0;
+let shuttingDown = false;
+
+function log(msg: string): void { console.log(`${new Date().toISOString()} ${msg}`); }
+async function notify(msg: string): Promise<void> { try { await telegram(msg); } catch (e) { log(`⚠️ Telegram failed: ${String(e).slice(0, 180)}`); } }
+function ageSec(createdAt: number): number { return Math.max(0, (Date.now() - createdAt) / 1000); }
+function openCount(): number { return [...positions.values()].filter((p) => p.status === "OPEN").length; }
+
+function isRealizedSellEvent(e: PositionEvent): e is Extract<PositionEvent, { soldQty: number; proceedsUsd: number }> {
+  return e.type === "TP" || e.type === "TRAIL_EXIT" || e.type === "STOP_EXIT" || e.type === "EARLY_EXIT" || e.type === "BREAKEVEN_EXIT" || e.type === "DRAIN_EXIT" || e.type === "TIME_EXIT";
+}
+
+function persist(force = false): void {
+  if (!config.recovery.enabled) return;
+  if (!force && Date.now() - lastPersist < 10_000) return;
+  lastPersist = Date.now();
+  try {
+    saveState(config.recovery.stateFile, {
+      version: 1,
+      savedAt: Date.now(),
+      cashUsd: portfolio.cashUsd,
+      closedTrades: [...portfolio.closedTrades],
+      openPositions: config.mode === "live" ? [] : [...positions.values()].filter((p) => p.status === "OPEN"),
+    });
+  } catch (e) { log(`⚠️ state persist failed: ${String(e)}`); }
+}
+
+function syncLivePortfolioCash(): void {
+  const cash = liveCashUsd();
+  if (Number.isFinite(cash) && cash >= 0) portfolio.restore(cash, [...portfolio.closedTrades]);
+}
+
+function restore(): void {
+  if (!config.recovery.enabled) return;
+  const s = loadState(config.recovery.stateFile);
+  portfolio.restore(s.cashUsd, s.closedTrades.filter((t) => t.chain === CHAIN));
+  if (config.mode === "live") {
+    // Live positions are rebuilt from the transaction journal, never from the
+    // secondary strategy state. The store only supplies closed-trade reporting.
+    log(`♻️ restored ${portfolio.closedTrades.length} closed RH trades from reporting state`);
+    return;
+  }
+  for (const p of s.openPositions) {
+    if (p.chain !== CHAIN || p.status !== "OPEN") continue;
+    p.lowestPrice ??= p.currentPrice;
+    p.highestAt ??= p.updatedAt;
+    p.lowestAt ??= p.openedAt;
+    p.trailHigh ??= p.highestPrice;
+    p.highStreak ??= 0;
+    p.shadowFeeUsd ??= 0;
+    p.shadowSlipUsd ??= 0;
+    p.exitProfile ??= robinhoodExitProfile();
+    positions.set(p.id, p);
+    ledgerCosts.set(p.id, { fee: p.totalExitFeeUsd, slip: p.totalSlippageUsd });
+    log(`♻️ restored ${p.id} ${p.symbol} entry=${p.entryPrice} qty=${p.quantity}`);
+  }
+  log(`♻️ restored ${positions.size} RH paper positions | ${portfolio.closedTrades.length} closed trades`);
+}
+
+function sameSymbolOpen(symbol: string): boolean {
+  const s = symbol.trim().toLowerCase();
+  return [...positions.values()].some((p) => p.status === "OPEN" && p.symbol.trim().toLowerCase() === s);
+}
+
+function alreadyTradedPool(key: string): boolean { return portfolio.closedTrades.some((t) => t.id === key); }
+
+function entryGates(): boolean {
+  if (isEntryPausedAt(new Date(), config.entry.pausedHoursUtc)) {
+    if (Date.now() - lastPausedLog > 3_600_000) { lastPausedLog = Date.now(); log("⏸️ entry hour paused (20–23 UTC)"); }
+    return false;
+  }
+  if (config.mode === "live") return liveEntryAllowed();
+  if (paperLossLimitBreached(portfolio.closedTrades, config.risk.paperDailyLossLimitUsd, Date.now())) return false;
+  const stops = recentStopCount(portfolio.closedTrades, CHAIN, Date.now(), config.risk.breakerWindowMin);
+  if (stops >= config.risk.breakerStops) return false;
+  if (rollingExpectancyNegative(portfolio.closedTrades, CHAIN, config.risk.expectancyTrades)) return false;
+  return openCount() < config.entry.maxOpenPositions;
+}
+
+function isAddress(value: string): boolean { return /^0x[0-9a-fA-F]{40}$/.test(value); }
+function quoteAllowed(pair: DexScreenerPair): boolean {
+  return pair.quoteToken.address.trim().toLowerCase() === RH.contracts.weth.toLowerCase()
+    && config.dexPaprika.quoteSymbols.includes(pair.quoteToken.symbol.trim().toLowerCase());
+}
+function dexAllowed(pair: DexScreenerPair): boolean { return config.dexPaprika.dexIds.includes(pair.dexId.toLowerCase()); }
+
+function makeCandidate(pool: Awaited<ReturnType<typeof fetchNewestPools>>[number], pair: DexScreenerPair): Candidate | null {
+  const price = parsePrice(pair);
+  if (price === null || !quoteAllowed(pair) || !dexAllowed(pair)) return null;
+  const liq = pairLiquidityUsd(pair);
+  if (liq === null || liq < config.dexPaprika.minLiquidityUsd || liq > config.dexPaprika.maxLiquidityUsd) return null;
+  if (!isAddress(pair.baseToken.address) || pair.baseToken.address.toLowerCase() === RH.contracts.weth.toLowerCase()) return null;
+  const key = `${CHAIN}:${pool.poolAddress.toLowerCase()}`;
+  return {
+    key, chain: CHAIN, poolAddress: pool.poolAddress, pairAddress: pair.pairAddress,
+    tokenAddress: pair.baseToken.address, tokenSymbol: pair.baseToken.symbol,
+    tokenName: pair.baseToken.name, quoteSymbol: pair.quoteToken.symbol, dexId: pair.dexId,
+    pair, discoveredAt: Date.now(), poolCreatedAt: pool.createdAtMs,
+  };
+}
+
+async function queueCandidate(candidate: Candidate): Promise<void> {
+  if (!entryGates()) return;
+  if (seenPools.has(candidate.key) || (config.entry.oneEntryPerPool && alreadyTradedPool(candidate.key))) return;
+  if (sameSymbolOpen(candidate.tokenSymbol)) return;
+  if (config.safety.blockRepeatSymbols && isRepeatSymbol(
+    [...positions.values()].filter((p) => p.status === "OPEN" && p.chain === CHAIN).map((p) => p.symbol),
+    portfolio.closedTrades, CHAIN, candidate.tokenSymbol,
+  )) {
+    log(`⏭️ skip entry ${candidate.key}: repeat symbol ${candidate.tokenSymbol} on ${CHAIN}`);
+    return;
+  }
+  seenPools.set(candidate.key, Date.now());
+  const price = parsePrice(candidate.pair);
+  if (price === null) return;
+  pendingConfirms.set(candidate.key, {
+    candidate,
+    firstPrice: price,
+    firstLiquidity: pairLiquidityUsd(candidate.pair),
+    fireAt: Date.now() + config.entry.confirmDelayMs,
+  });
+}
+
+async function discover(): Promise<void> {
+  const pools = await fetchNewestPools(CHAIN);
+  if (!pools.length) return;
+  if (pools.length >= config.dexPaprika.limit) log(`⚠️ discovery saturated at limit=${config.dexPaprika.limit}; increase DISCOVERY_LIMIT if candidates appear truncated`);
+  const pairs = await getPairsByChain(CHAIN, pools.map((p) => p.poolAddress));
+  const byAddress = new Map(pairs.map((p) => [p.pairAddress.toLowerCase(), p]));
+  for (const pool of pools) {
+    const pair = byAddress.get(pool.poolAddress.toLowerCase()) ?? await getPair(CHAIN, pool.poolAddress).catch(() => null);
+    if (!pair) continue;
+    const candidate = makeCandidate(pool, pair);
+    if (candidate) await queueCandidate(candidate);
+  }
+}
+
+async function paperOpen(c: Candidate, pair: DexScreenerPair, price: number): Promise<void> {
+  if (!portfolio.onOpen(config.entry.positionSizeUsd)) return;
+  try {
+    const entryLiq = pairLiquidityUsd(pair);
+    const p = openPosition({
+      id: c.key, chain: CHAIN, pairAddress: c.pairAddress, tokenAddress: c.tokenAddress,
+      symbol: c.tokenSymbol, tokenName: c.tokenName, quoteSymbol: pair.quoteToken.symbol,
+      dexId: pair.dexId, ...(pair.url ? { pairUrl: pair.url } : {}), marketPrice: price,
+      usdSize: config.entry.positionSizeUsd, balanceBeforeUsd: portfolio.cashUsd + config.entry.positionSizeUsd,
+      poolAddress: c.poolAddress, ...(entryLiq !== null ? { entryLiquidityUsd: entryLiq } : {}),
+      entryAgeSec: ageSec(c.poolCreatedAt), exitProfile: robinhoodExitProfile(),
+    });
+    positions.set(p.id, p);
+    ledgerCosts.set(p.id, { fee: p.totalExitFeeUsd, slip: p.totalSlippageUsd });
+    persist(true);
+    await recordFill({
+      time: Date.now(), side: "BUY", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol,
+      tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress,
+      quote: p.quoteSymbol, price: p.entryPrice, qty: p.quantity, notionalUsd: p.initialUsdSize,
+      feeUsd: p.totalEntryFeeUsd, slipUsd: p.totalSlippageUsd, detail: "paper",
+      balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: portfolio.equityUsd(positions.values()),
+    });
+    await notify(buildBuyMessage(p, config.entry.maxOpenPositions, openCount()));
+    probeQuotability(c, pair, price, config.entry.positionSizeUsd).catch((e) => log(`⚠️ quotability probe failed: ${String(e).slice(0, 120)}`));
+  } catch (error) {
+    portfolio.onProceeds(config.entry.positionSizeUsd);
+    throw error;
+  }
+}
+
+async function probeQuotability(c: Candidate, pair: DexScreenerPair, price: number, sizeUsd: number): Promise<void> {
+  const started = Date.now();
+  const base = {
+    time: started, positionId: c.key, chain: CHAIN, side: "BUY" as const,
+    paperPriceUsd: price, quotedSellAmount: "", quotedBuyAmount: "",
+    sellDecimals: 18 as number | null, buyDecimals: null as number | null,
+    riskPass: null as boolean | null, simOk: null as boolean | null,
+  };
+  try {
+    const ethUsd = Number(pair.priceUsd) / Number(pair.priceNative);
+    if (!(ethUsd > 0)) { await recordQuoteCheck({ ...base, source: "skipped", note: "no-eth-mark" }); return; }
+    const sellRaw = BigInt(Math.floor(sizeUsd / ethUsd * 1e18));
+    if (sellRaw <= 0n) { await recordQuoteCheck({ ...base, source: "skipped", note: "dust-size" }); return; }
+    let taker: string;
+    try { taker = traderAddress(); } catch { await recordQuoteCheck({ ...base, source: "skipped", note: "no-trader-key" }); return; }
+    const quote = await Promise.race([
+      quote0x({ chain: CHAIN, sellToken: pair.quoteToken.address, buyToken: c.tokenAddress, sellAmountBaseUnits: sellRaw.toString(), taker, slippageBps: config.live.buySlippageBps }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe timeout")), 20_000)),
+    ]);
+    await recordQuoteCheck({ ...base, source: "0x", quotedSellAmount: quote.sellAmount, quotedBuyAmount: quote.buyAmount, note: `quotable latencyMs=${Date.now() - started}; impact=${quote.priceImpactPct ?? "unknown"}` });
+  } catch (error) {
+    await recordQuoteCheck({ ...base, source: "none", note: `unindexed: ${String(error).slice(0, 160)}` });
+  }
+}
+
+async function liveOpen(c: Candidate, pair: DexScreenerPair): Promise<void> {
+  const result = await liveBuy(c, pair, config.entry.positionSizeUsd);
+  positions.set(result.position.id, result.position);
+  syncLivePortfolioCash();
+  persist(true);
+  await recordFill({
+    time: Date.now(), side: "BUY", positionId: result.position.id, chain: CHAIN,
+    dex: result.position.dexId, symbol: result.position.symbol, tokenName: result.position.tokenName,
+    pair: result.position.pairAddress, pool: result.position.poolAddress ?? "", ca: result.position.tokenAddress,
+    quote: result.position.quoteSymbol, price: result.position.entryPrice, qty: result.position.quantity,
+    notionalUsd: result.position.initialUsdSize, feeUsd: result.position.totalEntryFeeUsd,
+    slipUsd: result.position.totalSlippageUsd, detail: `live:${result.quote.source}:${result.executionHash}`,
+    balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: null,
+  });
+  await notify(buildBuyMessage(result.position, config.entry.maxOpenPositions, liveOpenCount()));
+}
+
+async function fireConfirms(): Promise<void> {
+  const now = Date.now();
+  for (const [key, item] of [...pendingConfirms]) {
+    if (item.fireAt > now) continue;
+    pendingConfirms.delete(key);
+    const pair = await getPair(CHAIN, item.candidate.pairAddress).catch(() => null);
+    if (!pair) continue;
+    const secondPrice = parsePrice(pair);
+    if (secondPrice === null) continue;
+    const verdict = assessConfirmation(
+      { price: item.firstPrice, liquidityUsd: item.firstLiquidity },
+      { price: secondPrice, liquidityUsd: pairLiquidityUsd(pair) },
+      config.entry.confirmMaxPriceDropPct, config.entry.confirmMaxLiqDropPct,
+    );
+    if (!verdict.ok || !entryGates() || sameSymbolOpen(item.candidate.tokenSymbol)) continue;
+    if (config.mode === "paper") {
+      if (config.entry.auto) await paperOpen(item.candidate, pair, secondPrice);
+    } else {
+      try { await liveOpen(item.candidate, pair); }
+      catch (e) { log(`🛑 RH live BUY refused/failed ${item.candidate.tokenSymbol}: ${String(e).slice(0, 260)}`); }
+    }
+  }
+}
+
+async function paperTick(p: Position, pair: DexScreenerPair): Promise<void> {
+  const price = parsePrice(pair);
+  if (price === null) return;
+  const now = Date.now();
+  const tickLiq = pairLiquidityUsd(pair);
+  const events = updatePosition(p, price, now, tickLiq === null ? {} : { liquidityUsd: tickLiq });
+  for (const e of events) {
+    if (e.type === "TP") {
+      portfolio.onProceeds(e.proceedsUsd);
+      const prev = ledgerCosts.get(p.id) ?? { fee: 0, slip: 0 };
+      const feeDelta = p.totalExitFeeUsd - prev.fee;
+      const slipDelta = p.totalSlippageUsd - prev.slip;
+      ledgerCosts.set(p.id, { fee: p.totalExitFeeUsd, slip: p.totalSlippageUsd });
+      await recordFill({ time: now, side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol, tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress, quote: p.quoteSymbol, price: e.price, qty: e.soldQty, notionalUsd: e.proceedsUsd, feeUsd: feeDelta, slipUsd: slipDelta, detail: `TP${e.level}`, balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: portfolio.equityUsd(positions.values()) });
+      await notify(buildTpMessage(p, e.level, e.gainPct, e.soldQty, e.proceedsUsd));
+    }
+    if (e.type === "TRAIL_ACTIVATED") await notify(buildUpdateMessage("TRAIL", p, e.trailStop));
+    if (e.type === "STOP_MOVED") await notify(buildUpdateMessage("BREAKEVEN", p, e.stopPrice));
+    if (isRealizedSellEvent(e) && e.type !== "TP") {
+      portfolio.onProceeds(e.proceedsUsd);
+      const exitLiq = pairLiquidityUsd(pair); if (exitLiq !== null) p.exitLiquidityUsd = exitLiq;
+      p.balanceAfterUsd = portfolio.equityUsd([...positions.values()].filter((x) => x.id !== p.id));
+      portfolio.onClose(p);
+      positions.delete(p.id); lastSnapshotAt.delete(p.id);
+      const prev = ledgerCosts.get(p.id) ?? { fee: p.totalEntryFeeUsd, slip: 0 };
+      ledgerCosts.delete(p.id);
+      await recordFill({ time: now, side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol, tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress, quote: p.quoteSymbol, price: e.price, qty: e.soldQty, notionalUsd: e.proceedsUsd, feeUsd: p.totalExitFeeUsd - prev.fee, slipUsd: p.totalSlippageUsd - prev.slip, detail: e.type, balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: p.balanceAfterUsd ?? portfolio.cashUsd });
+      await recordTrade(tradeRecordFromPosition(p, { pnlUsd: p.realizedPnlUsd, pnlPct: p.initialUsdSize > 0 ? p.realizedPnlUsd / p.initialUsdSize * 100 : 0, balanceBeforeUsd: p.balanceBeforeUsd ?? NaN, balanceAfterUsd: p.balanceAfterUsd ?? NaN }));
+      await notify(buildCloseMessage(p, portfolio.snapshot(positions.values()), portfolio.chainStat(CHAIN), portfolio.tokenPnlUsd(CHAIN, p.symbol)));
+      persist(true); break;
+    }
+  }
+  if (positions.has(p.id) && p.status === "OPEN" && now - (lastSnapshotAt.get(p.id) ?? 0) >= config.snapshots.intervalS * 1000) {
+    lastSnapshotAt.set(p.id, now);
+    await recordSnapshot({ time: now, positionId: p.id, chain: CHAIN, symbol: p.symbol, price, liquidityUsd: pairLiquidityUsd(pair), txnsJson: JSON.stringify(pair.txns ?? null) });
+  }
+}
+
+async function applyLiveSellFill(
+  p: Position,
+  pair: DexScreenerPair,
+  _kind: "TP" | "EXIT",
+  _level: number | undefined,
+  _reason: string,
+  sell: { orderId: string; result: { hash: string; sellAmount: string; buyAmount: string; gasUsd: number }; exitPriceUsd: number; realizedPnlUsd: number; gasUsd: number },
+): Promise<void> {
+  const before = p.quantity;
+  const orderId = sell.orderId;
+  const live = getLivePosition(p.id);
+  if (!live) throw new Error(`RH live position ${p.id} missing while applying SELL ${orderId}`);
+  // The live journal is the canonical state transition. Then rebuild the
+  // strategy position from that exact state so quantity/TP/exit-state cannot
+  // diverge from the confirmed chain fill.
+  await applyConfirmedLiveSell({ orderId, realizedPnlUsd: sell.realizedPnlUsd });
+  const rebuilt = restoredStrategyPositions().find((x) => x.id === p.id);
+  if (!rebuilt) throw new Error(`RH strategy position ${p.id} unavailable after confirmed SELL`);
+  Object.assign(p, rebuilt);
+  const outEth = Number(BigInt(sell.result.buyAmount)) / 1e18;
+  const ethUsd = Number(pair.priceUsd) / Number(pair.priceNative);
+  const proceedsUsd = outEth > 0 && Number.isFinite(ethUsd) && ethUsd > 0 ? outEth * ethUsd : NaN;
+  syncLivePortfolioCash();
+  await recordFill({
+    time: Date.now(), side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol,
+    tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress,
+    quote: p.quoteSymbol, price: sell.exitPriceUsd,
+    qty: before - p.quantity, notionalUsd: Number.isFinite(proceedsUsd) ? proceedsUsd : Math.max(0, sell.exitPriceUsd * (before - p.quantity)),
+    feeUsd: sell.gasUsd, slipUsd: 0, detail: `live:${_kind}${_level ? `:TP${_level}` : ""}:${sell.result.hash}`,
+    balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: null,
+  });
+  persist(true);
+}
+
+async function onLivePositionClosed(p: Position): Promise<void> {
+  const existing = portfolio.hasClosed(p.id);
+  if (!existing) {
+    portfolio.onClose(p);
+    await recordTrade(tradeRecordFromPosition(p, {
+      pnlUsd: p.realizedPnlUsd,
+      pnlPct: p.initialUsdSize > 0 ? p.realizedPnlUsd / p.initialUsdSize * 100 : 0,
+      balanceBeforeUsd: p.balanceBeforeUsd ?? NaN,
+      balanceAfterUsd: p.balanceAfterUsd ?? portfolio.cashUsd,
+    }));
+  }
+  syncLivePortfolioCash();
+  await notify(`### ${p.realizedPnlUsd >= 0 ? "✅" : "❌"} RH LIVE CLOSED — ${p.symbol}\n📈 Realized: ${p.realizedPnlUsd >= 0 ? "+" : "-"}$${Math.abs(p.realizedPnlUsd).toFixed(2)}\n🏷️ Reason: ${p.closedReason ?? "EXIT"}`);
+  finalizeLivePosition(p.id);
+  positions.delete(p.id);
+  lastSnapshotAt.delete(p.id);
+  ledgerCosts.delete(p.id);
+  persist(true);
+}
+
+async function liveTick(p: Position, pair: DexScreenerPair): Promise<void> {
+  const price = parsePrice(pair);
+  if (price === null || p.status !== "OPEN") return;
+  const now = Date.now();
+  const candidate = structuredClone(p);
+  const liveLiq = pairLiquidityUsd(pair);
+  const events = updatePosition(candidate, price, now, liveLiq === null ? {} : { liquidityUsd: liveLiq });
+
+  // Copy only mark/stop state. Quantity, realized PnL, TP flags, and CLOSED
+  // status are changed only by confirmed chain receipts.
+  p.currentPrice = candidate.currentPrice;
+  p.updatedAt = candidate.updatedAt;
+  p.highestPrice = candidate.highestPrice;
+  p.lowestPrice = candidate.lowestPrice;
+  p.highestAt = candidate.highestAt;
+  p.lowestAt = candidate.lowestAt;
+  p.trailingActive = candidate.trailingActive;
+  p.breakevenArmed = candidate.breakevenArmed;
+  if (candidate.trailHigh === undefined) delete p.trailHigh; else p.trailHigh = candidate.trailHigh;
+  if (candidate.highStreak === undefined) delete p.highStreak; else p.highStreak = candidate.highStreak;
+
+  for (const e of events) {
+    if (e.type === "TRAIL_ACTIVATED") await notify(buildUpdateMessage("TRAIL", p, e.trailStop));
+    if (e.type === "STOP_MOVED") await notify(buildUpdateMessage("BREAKEVEN", p, e.stopPrice));
+    if (["TP", "TRAIL_EXIT", "STOP_EXIT", "EARLY_EXIT", "BREAKEVEN_EXIT", "DRAIN_EXIT", "TIME_EXIT"].includes(e.type)) {
+      const kind = e.type === "TP" ? "TP" as const : "EXIT" as const;
+      const level = e.type === "TP" ? e.level : undefined;
+      const label = e.type === "TP" ? `TP${e.level}` : "EXIT";
+      if (!isLiveSellPending(p.id, label)) {
+        if (queueLiveSell({ positionId: p.id, kind, ...(level !== undefined ? { level } : {}), label })) log(`⏳ RH ${label} ${p.symbol} queued`);
+      }
+    }
+  }
+  syncLiveStrategyState(p, events.length > 0);
+  if (p.status === "OPEN" && now - (lastSnapshotAt.get(p.id) ?? 0) >= config.snapshots.intervalS * 1000) {
+    lastSnapshotAt.set(p.id, now);
+    await recordSnapshot({ time: now, positionId: p.id, chain: CHAIN, symbol: p.symbol, price, liquidityUsd: pairLiquidityUsd(pair), txnsJson: JSON.stringify(pair.txns ?? null) });
+  }
+}
+
+async function trackPositions(): Promise<void> {
+  const open = [...positions.values()].filter((p) => p.status === "OPEN");
+  if (!open.length) return;
+  const pairs = await getPairsByChain(CHAIN, open.map((p) => p.pairAddress));
+  const map = new Map(pairs.map((p) => [p.pairAddress.toLowerCase(), p]));
+  for (const p of open) {
+    const pair = map.get(p.pairAddress.toLowerCase()) ?? await getPair(CHAIN, p.pairAddress).catch(() => null);
+    if (!pair) continue;
+    if (config.mode === "paper") await paperTick(p, pair); else await liveTick(p, pair);
+  }
+}
+
+async function reconcileRecoveredPositions(): Promise<void> {
+  if (config.mode !== "live") return;
+  syncLivePortfolioCash();
+  for (const recovered of restoredStrategyPositions()) {
+    if (recovered.status === "CLOSED") await onLivePositionClosed(recovered);
+    else positions.set(recovered.id, recovered);
+  }
+  syncLivePortfolioCash();
+}
+
+async function health(): Promise<void> {
+  for (const [k, t] of [...seenPools]) if (Date.now() - t > 30 * 60_000) seenPools.delete(k);
+  if (config.mode === "live") { flushLiveState(); syncLivePortfolioCash(); }
+  else persist(false);
+}
+
+async function loop(name: string, interval: number, fn: () => Promise<void>): Promise<never> {
+  while (!shuttingDown) {
+    try { await fn(); } catch (e) { log(`⚠️ ${name}: ${String(e).slice(0, 400)}`); }
+    await new Promise((r) => setTimeout(r, interval));
+  }
+  return await new Promise<never>(() => {});
+}
+
+function traderSummary(): string { try { return traderAddress(); } catch { return "not configured"; } }
+
+async function main(): Promise<void> {
+  claimInstanceLockForStateFile(config.mode === "live" ? config.liveState.stateFile : config.recovery.stateFile);
+  console.log("============================================");
+  console.log(" Robinhood Chain New-Pool Trading Bot");
+  console.log("============================================");
+  console.log(`Mode                : ${config.mode}`);
+  console.log(`Chain               : Robinhood (4663)`);
+  console.log(`Discovery           : DexPaprika ${config.dexPaprika.minAgeSec}-${config.dexPaprika.maxAgeSec}s | $${config.dexPaprika.minLiquidityUsd}-${config.dexPaprika.maxLiquidityUsd}`);
+  console.log(`Confirmation        : ${config.entry.confirmDelayMs}ms`);
+  console.log(`Position            : $${config.entry.positionSizeUsd} | max ${config.entry.maxOpenPositions} | same symbol ${config.entry.maxSameSymbolOpen}`);
+  console.log(`Exit                : TP ${config.tp.map((x) => x.gainPct).join("/")} | trail +${config.stops.trailActivationPct}/${config.stops.trailDistancePct}% | hold ${config.entry.maxPositionAgeMin}m`);
+  console.log(`Price               : DexScreener @ ${config.dexScreener.intervalMs}ms`);
+  console.log(`0x                  : ${config.live.zeroExKey ? "key present" : "key absent"}`);
+  console.log(`Wallet              : ${config.live.enabled ? traderSummary() : "paper"}`);
+
+  await initAnalytics();
+  log(`Analytics           : ${analyticsStatus()}`);
+  restore();
+
+  if (config.live.enabled) {
+    await initLive(log);
+    syncLivePortfolioCash();
+    if (config.live.testTrade) {
+      try { await runLiveSmokeTest(log); }
+      catch (e) { latchHalt(`smoke test failed: ${String(e).slice(0, 200)}`, log); await notify(`🛑 RH smoke test FAILED: ${String(e).slice(0, 200)}. Live entries halted.`); }
+    }
+    await reconcileRecoveredPositions();
+    catchUpLiveSells(new Set([...positions.values()].filter((p) => p.status === "OPEN").map((p) => p.id)), log);
+    flushLiveState();
+  }
+
+  if (config.telegram.enabled) {
+    await testTelegram();
+    await notify(buildStartupMessage({ mode: config.mode, autoEntry: config.entry.auto, size: config.entry.positionSizeUsd, maxOpen: config.entry.maxOpenPositions, analytics: analyticsStatus(), live: config.live.enabled, ...(config.live.enabled ? { wallet: traderSummary() } : {}) }));
+  }
+
+  await Promise.all([
+    loop("discovery", config.dexPaprika.intervalMs, discover),
+    loop("confirms", 1_000, fireConfirms),
+    loop("price", config.dexScreener.intervalMs, trackPositions),
+    loop("health", 10_000, health),
+    loop("live-sells", 2_000, () => pumpLiveSells({
+      log,
+      notify,
+      getPosition: (id) => positions.get(id),
+      fetchPair: (pairAddress) => getPair(CHAIN, pairAddress).catch(() => null),
+      applyFill: applyLiveSellFill,
+      onClosed: onLivePositionClosed,
+      openPaperIds: () => new Set([...positions.values()].filter((p) => p.status === "OPEN").map((p) => p.id)),
+    })),
+  ]);
+}
+
+async function shutdown(): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  if (config.mode === "live") flushLiveState(); else persist(true);
+  try { await closeAnalytics(); } catch {}
+  process.exit(0);
+}
+
+process.once("SIGINT", shutdown);
+process.once("SIGTERM", shutdown);
+await main();
