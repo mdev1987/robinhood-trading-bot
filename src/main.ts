@@ -5,7 +5,7 @@ import { openPosition, updatePosition } from "./position.ts";
 import { Portfolio } from "./portfolio.ts";
 import { loadState, saveState } from "./store.ts";
 import {
-  analyticsStatus, closeAnalytics, initAnalytics, recordFill, recordQuoteCheck,
+  analyticsStatus, checkpointAnalytics, closeAnalytics, initAnalytics, recordFill, recordQuoteCheck,
   recordSnapshot, recordTrade, tradeRecordFromPosition,
 } from "./analytics.ts";
 import { telegram, testTelegram } from "./telegram.ts";
@@ -33,6 +33,7 @@ const ledgerCosts = new Map<string, { fee: number; slip: number }>();
 const pendingConfirms = new Map<string, { candidate: Candidate; firstPrice: number; firstLiquidity: number | null; fireAt: number }>();
 let lastPersist = 0;
 let lastPausedLog = 0;
+let lastCheckpointAt = 0;
 let shuttingDown = false;
 
 function log(msg: string): void { console.log(`${new Date().toISOString()} ${msg}`); }
@@ -438,6 +439,12 @@ async function health(): Promise<void> {
   for (const [k, t] of [...seenPools]) if (Date.now() - t > 30 * 60_000) seenPools.delete(k);
   if (config.mode === "live") { flushLiveState(); syncLivePortfolioCash(); }
   else persist(false);
+  // Bound the DuckDB WAL and keep external copies fresh: checkpoint at most
+  // every 5 minutes. Failures are best-effort inside checkpointAnalytics.
+  if (Date.now() - lastCheckpointAt >= 5 * 60_000) {
+    lastCheckpointAt = Date.now();
+    await checkpointAnalytics().catch(() => {});
+  }
 }
 
 async function loop(name: string, interval: number, fn: () => Promise<void>): Promise<never> {

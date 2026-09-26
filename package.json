@@ -6,7 +6,7 @@
   "scripts": {
     "start": "bun run src/main.ts",
     "check": "bunx tsc --noEmit",
-    "test": "bun test tests/",
+    "test": "NEW_POOL_MIN_AGE_SEC=60 NEW_POOL_MAX_AGE_SEC=120 PAPER_ENTRY_FEE_BPS=0 PAPER_EXIT_FEE_BPS=0 PAPER_SLIPPAGE_BPS=0 bun test tests/",
     "smoke": "node --experimental-strip-types tests/smoke.mjs"
   },
   "dependencies": {

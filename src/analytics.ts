@@ -447,6 +447,21 @@ export async function closeAnalytics(): Promise<void> {
   initPromise = null;
 }
 
+/**
+ * Best-effort CHECKPOINT: flushes the WAL into the main file so external
+ * readers (and file copies) see fresh rows and the WAL stays bounded.
+ * Safe to call on a timer; never throws.
+ */
+export async function checkpointAnalytics(): Promise<void> {
+  const c = conn && connPath === armed?.path ? conn : await ensure();
+  if (!c) return;
+  try {
+    await c.run("CHECKPOINT");
+  } catch {
+    // Best-effort: WAL replay on next open covers us.
+  }
+}
+
 export function tradeRecordFromPosition(
   position: Position,
   args: {
