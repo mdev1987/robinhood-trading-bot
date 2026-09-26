@@ -479,7 +479,7 @@ export function nextSellSlippageBps(baseBps: number, attempt: number): number {
   const step = SELL_STEPS[Math.min(Math.max(0, attempt), SELL_STEPS.length - 1)]!;
   return Math.min(config.live.sellMaxSlippageBps, Math.floor(baseBps * step));
 }
-export function sellRetryDelayMs(attempt: number): number { return 5_000 * Math.max(1, attempt); }
+export function sellRetryDelayMs(attempt: number): number { return 5_000 * (Math.max(0, attempt) + 1); }
 export function enqueueLiveSell(queue: PendingLiveSell[], item: Omit<PendingLiveSell, "attempts" | "nextAttemptAt">, now = Date.now()): { queue: PendingLiveSell[]; enqueued: boolean } {
   if (queue.some((q) => q.positionId === item.positionId && q.label === item.label)) return { queue, enqueued: false };
   const rest = item.kind === "EXIT" ? queue.filter((q) => q.positionId !== item.positionId) : queue;

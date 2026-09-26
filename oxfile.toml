@@ -26,10 +26,9 @@ crash_restart_limit = 5
 restart_delay_secs = 10
 stop_signal = "SIGTERM"
 stop_timeout_secs = 20
-# Liveness: the worker is silent on stdout when no candidates/positions
-# exist (discover() only logs saturation), so log mtime is NOT a signal.
-# The main-loop health task rewrites data/state.json ~every 10s; a stale
-# state.json (>3 min) means wedged on I/O. Manual check:
+# Liveness: discovery logs one line per cycle (~40s) plus state.json
+# rewrites ~every 10s via the health task. Either going stale (>3 min)
+# means wedged on I/O. Manual check:
 #   ./scripts/ox-health.sh; echo $?
 # No health_cmd is set because oxmgr 0.5.0's health executor is broken
 # server-side: even health_cmd="/usr/bin/true" reports

@@ -156,17 +156,30 @@ async function queueCandidate(candidate: Candidate): Promise<void> {
 }
 
 async function discover(): Promise<void> {
+  const started = Date.now();
   const pools = await fetchNewestPools(CHAIN);
-  if (!pools.length) return;
+  if (!pools.length) {
+    log(`🔎 discovery cycle complete in ${Date.now() - started}ms; pools=0 pendingConfirm=${pendingConfirms.size}`);
+    return;
+  }
   if (pools.length >= config.dexPaprika.limit) log(`⚠️ discovery saturated at limit=${config.dexPaprika.limit}; increase DISCOVERY_LIMIT if candidates appear truncated`);
   const pairs = await getPairsByChain(CHAIN, pools.map((p) => p.poolAddress));
   const byAddress = new Map(pairs.map((p) => [p.pairAddress.toLowerCase(), p]));
+  let queued = 0;
   for (const pool of pools) {
     const pair = byAddress.get(pool.poolAddress.toLowerCase()) ?? await getPair(CHAIN, pool.poolAddress).catch(() => null);
     if (!pair) continue;
     const candidate = makeCandidate(pool, pair);
-    if (candidate) await queueCandidate(candidate);
+    if (candidate) {
+      const before = pendingConfirms.size;
+      await queueCandidate(candidate);
+      if (pendingConfirms.size > before) {
+        queued++;
+        log(`🆕 ${CHAIN} ${candidate.tokenSymbol} ${candidate.poolAddress.slice(0, 6)}…${candidate.poolAddress.slice(-4)} price=$${parsePrice(pair)} liq=$${pairLiquidityUsd(pair) ?? "unknown"}`);
+      }
+    }
   }
+  log(`🔎 discovery cycle complete in ${Date.now() - started}ms; pools=${pools.length} pairs=${pairs.length} queued=${queued} pendingConfirm=${pendingConfirms.size}`);
 }
 
 async function paperOpen(c: Candidate, pair: DexScreenerPair, price: number): Promise<void> {
@@ -192,6 +205,7 @@ async function paperOpen(c: Candidate, pair: DexScreenerPair, price: number): Pr
       balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: portfolio.equityUsd(positions.values()),
     });
     await notify(buildBuyMessage(p, config.entry.maxOpenPositions, openCount()));
+    log(`💰 paper BUY ${p.symbol} entry=${p.entryPrice} qty=${p.quantity} open=${openCount()}/${config.entry.maxOpenPositions}`);
     probeQuotability(c, pair, price, config.entry.positionSizeUsd).catch((e) => log(`⚠️ quotability probe failed: ${String(e).slice(0, 120)}`));
   } catch (error) {
     portfolio.onProceeds(config.entry.positionSizeUsd);
@@ -239,6 +253,7 @@ async function liveOpen(c: Candidate, pair: DexScreenerPair): Promise<void> {
     balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: null,
   });
   await notify(buildBuyMessage(result.position, config.entry.maxOpenPositions, liveOpenCount()));
+  log(`💰 RH LIVE BUY ${result.position.symbol} entry=${result.position.entryPrice} qty=${result.position.quantity} hash=${result.executionHash}`);
 }
 
 async function fireConfirms(): Promise<void> {

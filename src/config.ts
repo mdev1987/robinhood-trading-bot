@@ -195,6 +195,8 @@ export const config = {
 };
 
 if (config.dexPaprika.limit < 1 || config.dexPaprika.limit > 100 || !Number.isInteger(config.dexPaprika.limit)) throw new Error("DISCOVERY_LIMIT must be integer 1..100");
+if (config.dexPaprika.dexIds.length === 0) throw new Error("DEX_IDS must list at least one venue (e.g. uniswap) — empty list rejects every candidate");
+if (config.dexPaprika.quoteSymbols.length === 0) throw new Error("QUOTE_SYMBOLS must list at least one symbol (e.g. WETH) — empty list rejects every candidate");
 if (config.dexPaprika.minAgeSec < 0 || config.dexPaprika.minAgeSec >= config.dexPaprika.maxAgeSec) throw new Error("Invalid pool age band");
 if (config.dexPaprika.minLiquidityUsd <= 0 || config.dexPaprika.minLiquidityUsd >= config.dexPaprika.maxLiquidityUsd) throw new Error("Invalid liquidity band");
 if (config.dexScreener.maxRpm < 1 || config.dexScreener.maxRpm > 300) throw new Error("DEXSCREENER_MAX_RPM must be 1..300");

@@ -99,7 +99,7 @@ async function reserveCheck(quote: Quote): Promise<void> {
   const client = getEvmPublicClient();
   const estimatedRaw = quote.estimatedGasUnits && quote.estimatedGasUnits > 0
     ? BigInt(Math.ceil(quote.estimatedGasUnits))
-    : await client.estimateGas({ from: traderAddress(), to: quote.to as Address, data: quote.calldata as `0x${string}`, value });
+    : await client.estimateGas({ account: traderAddress(), to: quote.to as Address, data: quote.calldata as `0x${string}`, value });
   const estimated = BigInt(estimatedRaw);
   const gasPrice = BigInt(await client.getGasPrice());
   const reserve = BigInt(Math.floor(config.live.minEthReserveEth * 1e18));
