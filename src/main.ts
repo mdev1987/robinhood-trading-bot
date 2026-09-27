@@ -9,7 +9,7 @@ import {
   recordSnapshot, recordTrade, tradeRecordFromPosition,
 } from "./analytics.ts";
 import { telegram, testTelegram } from "./telegram.ts";
-import { buildBuyMessage, buildCloseMessage, buildStartupMessage, buildTpMessage, buildUpdateMessage } from "./report.ts";
+import { buildBuyMessage, buildCloseMessage, buildLiveClosedMessage, buildStartupMessage, buildTpMessage, buildUpdateMessage } from "./report.ts";
 import type { Candidate, DexScreenerPair, Position } from "./types.ts";
 import type { PositionEvent } from "./position.ts";
 import { recentStopCount, rollingExpectancyNegative, paperLossLimitBreached, isRepeatSymbol } from "./breakers.ts";
@@ -18,7 +18,7 @@ import {
   liveBuy, liveEntryAllowed, liveOpenCount, initLive, restoredStrategyPositions,
   pumpLiveSells, queueLiveSell, isLiveSellPending, catchUpLiveSells,
   syncLiveStrategyState, flushLiveState, getLivePosition, finalizeLivePosition,
-  liveCashUsd, latchHalt, applyConfirmedLiveSell,
+  liveCashUsd, latchHalt, applyConfirmedLiveSell, liveStatus,
 } from "./live.ts";
 import { getEvmPublicClient, traderAddress } from "./execution/evm/viem-client.ts";
 import { getBestExecutableQuote, makeQuoteRequest } from "./execution/router.ts";
@@ -31,6 +31,8 @@ const seenPools = new Map<string, number>();
 const lastSnapshotAt = new Map<string, number>();
 const ledgerCosts = new Map<string, { fee: number; slip: number }>();
 const pendingConfirms = new Map<string, { candidate: Candidate; firstPrice: number; firstLiquidity: number | null; fireAt: number }>();
+/** Pre-exit live cash per position, for the close message's balance leg. */
+const exitCash = new Map<string, { before: number; after: number }>();
 let lastPersist = 0;
 let lastPausedLog = 0;
 let lastCheckpointAt = 0;
@@ -236,7 +238,7 @@ async function paperOpen(c: Candidate, pair: DexScreenerPair, price: number): Pr
       feeUsd: p.totalEntryFeeUsd, slipUsd: p.totalSlippageUsd, detail: "paper",
       balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: portfolio.equityUsd(positions.values()),
     });
-    await notify(buildBuyMessage(p, config.entry.maxOpenPositions, openCount()));
+    await notify(buildBuyMessage(p, config.entry.maxOpenPositions, openCount(), p.balanceBeforeUsd, portfolio.cashUsd));
     log(`💰 paper BUY ${p.symbol} entry=${p.entryPrice} qty=${p.quantity} open=${openCount()}/${config.entry.maxOpenPositions}`);
   } catch (error) {
     portfolio.onProceeds(config.entry.positionSizeUsd);
@@ -355,6 +357,7 @@ async function probeSellQuotability(p: Position, pair: DexScreenerPair, soldQtyU
 }
 
 async function liveOpen(c: Candidate, pair: DexScreenerPair): Promise<void> {
+  const cashBefore = liveCashUsd();
   const result = await liveBuy(c, pair, config.entry.positionSizeUsd);
   positions.set(result.position.id, result.position);
   syncLivePortfolioCash();
@@ -368,7 +371,7 @@ async function liveOpen(c: Candidate, pair: DexScreenerPair): Promise<void> {
     slipUsd: result.position.totalSlippageUsd, detail: `live:${result.quote.source}:${result.executionHash}`,
     balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: null,
   });
-  await notify(buildBuyMessage(result.position, config.entry.maxOpenPositions, liveOpenCount()));
+  await notify(buildBuyMessage(result.position, config.entry.maxOpenPositions, liveOpenCount(), cashBefore, liveCashUsd()));
   log(`💰 RH LIVE BUY ${result.position.symbol} entry=${result.position.entryPrice} qty=${result.position.quantity} hash=${result.executionHash}`);
 }
 
@@ -423,6 +426,7 @@ async function paperTick(p: Position, pair: DexScreenerPair): Promise<void> {
   const events = updatePosition(p, price, now, tickLiq === null ? {} : { liquidityUsd: tickLiq });
   for (const e of events) {
     if (e.type === "TP") {
+      const cashBefore = portfolio.cashUsd;
       portfolio.onProceeds(e.proceedsUsd);
       applyPaperGas(p, "EXIT");
       applyExitHaircut(p, e.proceedsUsd);
@@ -431,12 +435,13 @@ async function paperTick(p: Position, pair: DexScreenerPair): Promise<void> {
       const slipDelta = p.totalSlippageUsd - prev.slip;
       ledgerCosts.set(p.id, { fee: p.totalExitFeeUsd, slip: p.totalSlippageUsd });
       await recordFill({ time: now, side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol, tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress, quote: p.quoteSymbol, price: e.price, qty: e.soldQty, notionalUsd: e.proceedsUsd, feeUsd: feeDelta, slipUsd: slipDelta, detail: `TP${e.level}`, balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: portfolio.equityUsd(positions.values()) });
-      await notify(buildTpMessage(p, e.level, e.gainPct, e.soldQty, e.proceedsUsd, e.realizedPnlUsd - config.entry.gasPerFillUsd, e.remainingPct));
+      await notify(buildTpMessage(p, e.level, e.gainPct, e.soldQty, e.proceedsUsd, e.realizedPnlUsd - config.entry.gasPerFillUsd, e.remainingPct, cashBefore, portfolio.cashUsd));
       probeSellQuotability(p, pair, e.soldQty, `TP${e.level}`, e.price).catch((err) => log(`⚠️ sell probe failed: ${String(err).slice(0, 120)}`));
     }
-    if (e.type === "TRAIL_ACTIVATED") await notify(buildUpdateMessage("TRAIL", p, e.trailStop));
-    if (e.type === "STOP_MOVED") await notify(buildUpdateMessage("BREAKEVEN", p, e.stopPrice));
+    if (e.type === "TRAIL_ACTIVATED") await notify(buildUpdateMessage("TRAIL", p, e.trailStop, portfolio.cashUsd));
+    if (e.type === "STOP_MOVED") await notify(buildUpdateMessage("BREAKEVEN", p, e.stopPrice, portfolio.cashUsd));
     if (isRealizedSellEvent(e) && e.type !== "TP") {
+      const cashBefore = portfolio.cashUsd;
       portfolio.onProceeds(e.proceedsUsd);
       applyPaperGas(p, "EXIT");
       applyExitHaircut(p, e.proceedsUsd);
@@ -482,6 +487,10 @@ async function applyLiveSellFill(
   const ethUsd = Number(pair.priceUsd) / Number(pair.priceNative);
   const proceedsUsd = outEth > 0 && Number.isFinite(ethUsd) && ethUsd > 0 ? outEth * ethUsd : NaN;
   syncLivePortfolioCash();
+  exitCash.set(p.id, {
+    before: portfolio.cashUsd - (Number.isFinite(proceedsUsd) ? proceedsUsd : 0) + (sell.gasUsd ?? 0),
+    after: portfolio.cashUsd,
+  });
   await recordFill({
     time: Date.now(), side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol,
     tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress,
@@ -505,7 +514,9 @@ async function onLivePositionClosed(p: Position): Promise<void> {
     }));
   }
   syncLivePortfolioCash();
-  await notify(`### ${p.realizedPnlUsd >= 0 ? "✅" : "❌"} RH LIVE CLOSED — ${p.symbol}\n📈 Realized: ${p.realizedPnlUsd >= 0 ? "+" : "-"}$${Math.abs(p.realizedPnlUsd).toFixed(2)}\n🏷️ Reason: ${p.closedReason ?? "EXIT"}`);
+  const exitLeg = exitCash.get(p.id);
+  exitCash.delete(p.id);
+  await notify(buildLiveClosedMessage(p.symbol, p.closedReason ?? "EXIT", p.realizedPnlUsd, liveStatus().dailyRealizedPnlUsd, exitLeg?.before, liveCashUsd()));
   finalizeLivePosition(p.id);
   positions.delete(p.id);
   lastSnapshotAt.delete(p.id);
@@ -535,8 +546,8 @@ async function liveTick(p: Position, pair: DexScreenerPair): Promise<void> {
   if (candidate.highStreak === undefined) delete p.highStreak; else p.highStreak = candidate.highStreak;
 
   for (const e of events) {
-    if (e.type === "TRAIL_ACTIVATED") await notify(buildUpdateMessage("TRAIL", p, e.trailStop));
-    if (e.type === "STOP_MOVED") await notify(buildUpdateMessage("BREAKEVEN", p, e.stopPrice));
+    if (e.type === "TRAIL_ACTIVATED") await notify(buildUpdateMessage("TRAIL", p, e.trailStop, liveCashUsd()));
+    if (e.type === "STOP_MOVED") await notify(buildUpdateMessage("BREAKEVEN", p, e.stopPrice, liveCashUsd()));
     if (["TP", "TRAIL_EXIT", "STOP_EXIT", "EARLY_EXIT", "BREAKEVEN_EXIT", "DRAIN_EXIT", "TIME_EXIT"].includes(e.type)) {
       const kind = e.type === "TP" ? "TP" as const : "EXIT" as const;
       const level = e.type === "TP" ? e.level : undefined;
@@ -630,7 +641,7 @@ async function main(): Promise<void> {
 
   if (config.telegram.enabled) {
     await testTelegram();
-    await notify(buildStartupMessage({ mode: config.mode, autoEntry: config.entry.auto, size: config.entry.positionSizeUsd, maxOpen: config.entry.maxOpenPositions, analytics: analyticsStatus(), live: config.live.enabled, ...(config.live.enabled ? { wallet: traderSummary() } : {}) }));
+    await notify(buildStartupMessage({ mode: config.mode, autoEntry: config.entry.auto, size: config.entry.positionSizeUsd, maxOpen: config.entry.maxOpenPositions, analytics: analyticsStatus(), live: config.live.enabled, ...(config.live.enabled ? { wallet: traderSummary() } : {}), cashUsd: config.mode === "live" ? liveCashUsd() : portfolio.cashUsd }));
   }
 
   await Promise.all([

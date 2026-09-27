@@ -415,11 +415,12 @@ export async function liveBuy(candidate: Candidate, pair: DexScreenerPair, sizeU
   p.entryPrice = costUsd / qty; p.currentPrice = p.entryPrice; p.highestPrice = p.entryPrice; p.lowestPrice = p.entryPrice; p.totalEntryFeeUsd = gasUsd; p.totalExitFeeUsd = 0; p.totalSlippageUsd = 0; p.realizedPnlUsd = -gasUsd;
   const lp: LivePosition = { positionId: p.id, pairAddress: p.pairAddress, tokenAddress: p.tokenAddress, tokenSymbol: p.symbol, tokenName: p.tokenName, dexId: p.dexId, ...(p.pairUrl ? { pairUrl: p.pairUrl } : {}), quoteSymbol: "ETH", tokenDecimals: decimals, quoteToken: NATIVE, quoteDecimals: 18, originalQtyRaw: result.buyAmount, remainingQtyRaw: result.buyAmount, entryCostQuoteRaw: result.sellAmount, entryCostUsd: costUsd, entryPriceUsd: p.entryPrice, entryLiquidityUsd: p.entryLiquidityUsd ?? 0, entryAgeSec: p.entryAgeSec ?? 0, entryGasUsd: gasUsd, realizedPnlUsd: 0, openedAt: p.openedAt, updatedAt: Date.now(), strategy: captureStrategyState(p) };
   livePositions.set(p.id, lp);
+  const buyCashBefore = portfolioCashUsd;
   adjustLiveCashUsd(-(costUsd + gasUsd));
   Object.assign(order, { status: "APPLIED", txHash: result.hash, executedSellRaw: result.sellAmount, executedBuyRaw: result.buyAmount, gasUsd });
   persist();
-  await telegramSafe(buildLiveSubmittedMessage(p.symbol, "BUY", result.hash, costUsd));
-  await telegramSafe(buildLiveFillConfirmedMessage(p.symbol, "BUY", result.hash, result.sellAmount, result.buyAmount));
+  await telegramSafe(buildLiveSubmittedMessage(p.symbol, "BUY", result.hash, costUsd, buyCashBefore, portfolioCashUsd));
+  await telegramSafe(buildLiveFillConfirmedMessage(p.symbol, "BUY", result.hash, result.sellAmount, result.buyAmount, buyCashBefore, portfolioCashUsd));
   return { position: p, live: lp, quote, executionHash: result.hash };
 }
 
@@ -458,8 +459,8 @@ export async function liveSell(position: Position, pair: DexScreenerPair, sellRa
   const realizedPnlUsd = soldUnits * (exitPriceUsd - position.entryPrice) - gasUsd;
   Object.assign(order, { status: "CONFIRMED", txHash: result.hash, executedSellRaw: result.sellAmount, executedBuyRaw: result.buyAmount, gasUsd, exitEthUsd: ethUsd, exitPriceUsd, realizedPnlUsd, ...(pair.liquidity?.usd !== undefined ? { exitLiquidityUsd: pair.liquidity.usd } : {}), reason: reasonOverride ?? (kind === "TP" ? `TP${level ?? ""}` : (position.closedReason ?? label)) });
   persist();
-  await telegramSafe(buildLiveSubmittedMessage(position.symbol, "SELL", result.hash));
-  await telegramSafe(buildLiveFillConfirmedMessage(position.symbol, "SELL", result.hash, result.sellAmount, result.buyAmount));
+  await telegramSafe(buildLiveSubmittedMessage(position.symbol, "SELL", result.hash, undefined, portfolioCashUsd, portfolioCashUsd));
+  await telegramSafe(buildLiveFillConfirmedMessage(position.symbol, "SELL", result.hash, result.sellAmount, result.buyAmount, portfolioCashUsd, portfolioCashUsd));
   return { orderId: order.id, result: { hash: result.hash, sellAmount: result.sellAmount, buyAmount: result.buyAmount, gasUsd }, exitPriceUsd, realizedPnlUsd, gasUsd };
 }
 

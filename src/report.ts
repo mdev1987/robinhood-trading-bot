@@ -31,7 +31,15 @@ function badge(reason?: string): string {
   }
 }
 
-export function buildBuyMessage(p: Position, maxOpen: number, openCount: number): string {
+/** Cash leg for every message: before → after around the event. */
+function balanceLine(beforeUsd: number | undefined, afterUsd: number | undefined): string {
+  if (beforeUsd === undefined || afterUsd === undefined) return "";
+  if (Number.isFinite(beforeUsd) && Number.isFinite(afterUsd)) return `💰 Balance: ${usd(beforeUsd)} → ${usd(afterUsd)}`;
+  if (Number.isFinite(afterUsd)) return `💰 Balance: ${usd(afterUsd)}`;
+  return "";
+}
+
+export function buildBuyMessage(p: Position, maxOpen: number, openCount: number, balanceBeforeUsd?: number, balanceAfterUsd?: number): string {
   const ex = p.exitProfile;
   return [
     `### 🟢 ${p.chain.toUpperCase()} BUY — ${p.symbol || "UNKNOWN"}`,
@@ -45,26 +53,29 @@ export function buildBuyMessage(p: Position, maxOpen: number, openCount: number)
     `🛡️ SL: ${price(p.entryPrice * (1 - (ex?.initialStopPct ?? 15) / 100))}`,
     `🎯 TP: ${(ex?.tp ?? []).map((t) => `+${t.gainPct}%`).join(" / ")}  |  🌀 Trail: +${ex?.trailActivationPct ?? 30}% / ${ex?.trailDistancePct ?? 15}%`,
     `⏳ Max hold: ${ex?.maxPositionAgeMin ?? 60}m  |  📂 Open: ${openCount}/${maxOpen}`,
+    balanceLine(balanceBeforeUsd ?? p.balanceBeforeUsd, balanceAfterUsd),
     p.pairUrl ? `[DexScreener](${p.pairUrl})` : "",
   ].filter(Boolean).join("\n");
 }
 
-export function buildTpMessage(p: Position, level: number, gainPct: number, soldQty: number, proceedsUsd: number, realizedPnlUsd: number, remainingPctAfter: number): string {
+export function buildTpMessage(p: Position, level: number, gainPct: number, soldQty: number, proceedsUsd: number, realizedPnlUsd: number, remainingPctAfter: number, balanceBeforeUsd?: number, balanceAfterUsd?: number): string {
   return [
     `### 💰 TP${level} — ${p.symbol} (${pct(gainPct)})`,
     `🏹 robinhood | ${p.dexId} | \`${p.pairAddress}\``,
     `💲 Price: ${price(p.currentPrice)}  |  Sold: ${soldQty.toPrecision(8)} units`,
     `💵 Proceeds: ${usd(proceedsUsd)}`,
     `📈 Realized: ${signedUsd(realizedPnlUsd)}  |  Remaining: ${remainingPctAfter.toFixed(1)}%`,
-  ].join("\n");
+    balanceLine(balanceBeforeUsd, balanceAfterUsd),
+  ].filter(Boolean).join("\n");
 }
 
-export function buildUpdateMessage(kind: "TRAIL" | "BREAKEVEN", p: Position, stop: number): string {
+export function buildUpdateMessage(kind: "TRAIL" | "BREAKEVEN", p: Position, stop: number, balanceUsd?: number): string {
   return [
     `### ${kind === "TRAIL" ? "📈 TRAILING ACTIVATED" : "🛟 STOP → BREAKEVEN"} — ${p.symbol}`,
     `🏹 robinhood | Price: ${price(p.currentPrice)} | Stop: ${price(stop)}`,
     `📦 Remaining: ${remainingPct(p).toFixed(1)}%`,
-  ].join("\n");
+    balanceUsd !== undefined ? `💰 Balance: ${usd(balanceUsd)} (no change)` : "",
+  ].filter(Boolean).join("\n");
 }
 
 export function buildCloseMessage(p: Position, snap: PortfolioSnapshot, chainStat: ChainStat, tokenStat: { trades: number; pnlUsd: number }): string {
@@ -80,6 +91,7 @@ export function buildCloseMessage(p: Position, snap: PortfolioSnapshot, chainSta
     `📈 PnL: ${signedUsd(pnl)} (${pct(totalPnlPct(p))})`,
     `🧾 ${SHADOW_COST_MODEL}: ${signedUsd(pnl - p.shadowFeeUsd - p.shadowSlipUsd)}`,
     `📦 Size: ${usd(p.initialUsdSize)} | ⏳ ${duration((p.closedAt ?? Date.now()) - p.openedAt)}`,
+    balanceLine(p.balanceBeforeUsd, snap.cashUsd),
     `📊 Portfolio: #${snap.totalTrades} | ${snap.winRatePct.toFixed(1)}% WR | Total ${signedUsd(snap.totalPnlUsd)} | Equity ${usd(snap.equityUsd)}`,
     `🏹 robinhood: ${chainStat.trades} trades | ${chainStat.trades ? ((chainStat.wins / chainStat.trades) * 100).toFixed(1) : "0.0"}% WR | ${signedUsd(chainStat.pnlUsd)}`,
     `🪙 ${p.symbol}: ${tokenStat.trades} trades | ${signedUsd(tokenStat.pnlUsd)}`,
@@ -88,13 +100,14 @@ export function buildCloseMessage(p: Position, snap: PortfolioSnapshot, chainSta
 }
 
 export function buildStartupMessage(args: {
-  mode: string; autoEntry: boolean; size: number; maxOpen: number; analytics: string; live: boolean; wallet?: string;
+  mode: string; autoEntry: boolean; size: number; maxOpen: number; analytics: string; live: boolean; wallet?: string; cashUsd?: number;
 }): string {
   return [
     "### 🤖 ROBINHOOD BOT STARTED",
     `📝 Mode: ${args.mode} | Auto entry: ${args.autoEntry}`,
     `🏹 Chain: Robinhood (4663) | DEX: Uniswap-focused discovery`,
     `📦 Size: ${usd(args.size)} | Max open: ${args.maxOpen}`,
+    args.cashUsd !== undefined ? `💰 Balance: ${usd(args.cashUsd)}` : "",
     `🔎 Discovery: DexPaprika | 💲 Price: DexScreener @ 1s`,
     `📈 Strategy: 60–120s pools | $15k–$100k liquidity | confirm 3s`,
     `🎯 TP: +30/+60/+100 | Trail: +30 / 15% | Max hold: 60m`,
@@ -109,31 +122,34 @@ function configuredDailyLoss(): number {
   return Number.isFinite(v) ? v : 25;
 }
 
-export function buildLiveSubmittedMessage(symbol: string, side: "BUY" | "SELL", hash: string, sizeUsd?: number): string {
+export function buildLiveSubmittedMessage(symbol: string, side: "BUY" | "SELL", hash: string, sizeUsd?: number, balanceBeforeUsd?: number, balanceAfterUsd?: number): string {
   return [
     `### ${side === "BUY" ? "🟢 LIVE BUY" : "🔴 LIVE SELL"} SUBMITTED — ${symbol}`,
     `🏹 robinhood${sizeUsd !== undefined ? ` | ${usd(sizeUsd)}` : ""}`,
     `🔗 \`${hash}\``,
     `[Blockscout](${RH_TX(hash)})`,
-  ].join("\n");
+    balanceLine(balanceBeforeUsd, balanceAfterUsd),
+  ].filter(Boolean).join("\n");
 }
 
-export function buildLiveFillConfirmedMessage(symbol: string, side: "BUY" | "SELL", hash: string, sellRaw: string, buyRaw: string): string {
+export function buildLiveFillConfirmedMessage(symbol: string, side: "BUY" | "SELL", hash: string, sellRaw: string, buyRaw: string, balanceBeforeUsd?: number, balanceAfterUsd?: number): string {
   return [
     `### ${side === "BUY" ? "✅ LIVE BUY FILLED" : "✅ LIVE SELL FILLED"} — ${symbol}`,
     `📦 In: \`${sellRaw}\` → Out: \`${buyRaw}\``,
     `🔗 \`${hash}\``,
     `[Blockscout](${RH_TX(hash)})`,
-  ].join("\n");
+    balanceLine(balanceBeforeUsd, balanceAfterUsd),
+  ].filter(Boolean).join("\n");
 }
 function RH_TX(hash: string): string { return `https://robinhoodchain.blockscout.com/tx/${hash}`; }
 
-export function buildLiveClosedMessage(symbol: string, reason: string, realizedPnlUsd: number, dailyPnlUsd: number): string {
+export function buildLiveClosedMessage(symbol: string, reason: string, realizedPnlUsd: number, dailyPnlUsd: number, balanceBeforeUsd?: number, balanceAfterUsd?: number): string {
   const signed = (v: number) => `${v >= 0 ? "+" : "-"}$${Math.abs(v).toFixed(2)}`;
   return [
     `### ${realizedPnlUsd > 0 ? "✅" : realizedPnlUsd < 0 ? "❌" : "➖"} LIVE CLOSED — ${symbol}`,
     `🏹 robinhood | Reason: ${reason}`,
     `📈 Realized PnL: ${signed(realizedPnlUsd)}`,
     `📅 Daily live PnL: ${signed(dailyPnlUsd)}`,
-  ].join("\n");
+    balanceLine(balanceBeforeUsd, balanceAfterUsd),
+  ].filter(Boolean).join("\n");
 }
