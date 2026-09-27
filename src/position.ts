@@ -14,7 +14,7 @@ export const SHADOW_SLIPPAGE_BPS = 100;
 export const SHADOW_COST_MODEL = "NET_PNL_100BPS_1PCT";
 
 export type PositionEvent =
-  | { type: "TP"; level: 1 | 2 | 3; gainPct: number; sellPct: number; price: number; soldQty: number; proceedsUsd: number; realizedPnlUsd: number }
+  | { type: "TP"; level: 1 | 2 | 3; gainPct: number; sellPct: number; price: number; soldQty: number; proceedsUsd: number; realizedPnlUsd: number; remainingPct: number }
   | { type: "TRAIL_ACTIVATED"; price: number; trailStop: number }
   | { type: "STOP_MOVED"; mode: "BREAKEVEN"; price: number; stopPrice: number }
   | { type: "TRAIL_EXIT"; price: number; soldQty: number; proceedsUsd: number; realizedPnlUsd: number; gainPct: number }
@@ -316,6 +316,7 @@ export function updatePosition(
         soldQty: sold,
         proceedsUsd,
         realizedPnlUsd: position.realizedPnlUsd,
+        remainingPct: remainingPct(position),
       });
     }
   }

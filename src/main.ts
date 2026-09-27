@@ -1,4 +1,4 @@
-import { config, isEntryPausedAt, RH, robinhoodExitProfile } from "./config.ts";
+import { config, isEntryPausedAt, isPoolEntryBandValid, RH, robinhoodExitProfile } from "./config.ts";
 import { fetchNewestPools } from "./dexpaprika.ts";
 import { assessConfirmation, getPair, getPairsByChain, parsePrice, pairLiquidityUsd } from "./dexscreener.ts";
 import { openPosition, updatePosition } from "./position.ts";
@@ -272,12 +272,24 @@ async function fireConfirms(): Promise<void> {
     if (!pair) continue;
     const secondPrice = parsePrice(pair);
     if (secondPrice === null) continue;
+    const secondLiquidity = pairLiquidityUsd(pair);
     const verdict = assessConfirmation(
       { price: item.firstPrice, liquidityUsd: item.firstLiquidity },
-      { price: secondPrice, liquidityUsd: pairLiquidityUsd(pair) },
+      { price: secondPrice, liquidityUsd: secondLiquidity },
       config.entry.confirmMaxPriceDropPct, config.entry.confirmMaxLiqDropPct,
     );
-    if (!verdict.ok || !entryGates() || sameSymbolOpen(item.candidate.tokenSymbol)) continue;
+    if (!verdict.ok) continue;
+
+    // Discovery applies the age/liquidity band, but the 3s confirmation
+    // delay can move a candidate outside that band before BUY. Treat this as
+    // a hard final-entry gate so paper and live executions obey the strategy
+    // that the startup/reporting config advertises.
+    if (!isPoolEntryBandValid(item.candidate.poolCreatedAt, secondLiquidity)) {
+      log(`⏭️ skip entry ${item.candidate.tokenSymbol}: final band check failed (age=${ageSec(item.candidate.poolCreatedAt).toFixed(1)}s liq=$${secondLiquidity ?? "unknown"})`);
+      continue;
+    }
+
+    if (!entryGates() || sameSymbolOpen(item.candidate.tokenSymbol)) continue;
     if (config.mode === "paper") {
       if (config.entry.auto) await paperOpen(item.candidate, pair, secondPrice);
     } else {
@@ -301,7 +313,7 @@ async function paperTick(p: Position, pair: DexScreenerPair): Promise<void> {
       const slipDelta = p.totalSlippageUsd - prev.slip;
       ledgerCosts.set(p.id, { fee: p.totalExitFeeUsd, slip: p.totalSlippageUsd });
       await recordFill({ time: now, side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol, tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress, quote: p.quoteSymbol, price: e.price, qty: e.soldQty, notionalUsd: e.proceedsUsd, feeUsd: feeDelta, slipUsd: slipDelta, detail: `TP${e.level}`, balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: portfolio.equityUsd(positions.values()) });
-      await notify(buildTpMessage(p, e.level, e.gainPct, e.soldQty, e.proceedsUsd));
+      await notify(buildTpMessage(p, e.level, e.gainPct, e.soldQty, e.proceedsUsd, e.realizedPnlUsd, e.remainingPct));
     }
     if (e.type === "TRAIL_ACTIVATED") await notify(buildUpdateMessage("TRAIL", p, e.trailStop));
     if (e.type === "STOP_MOVED") await notify(buildUpdateMessage("BREAKEVEN", p, e.stopPrice));

@@ -49,13 +49,13 @@ export function buildBuyMessage(p: Position, maxOpen: number, openCount: number)
   ].filter(Boolean).join("\n");
 }
 
-export function buildTpMessage(p: Position, level: number, gainPct: number, soldQty: number, proceedsUsd: number): string {
+export function buildTpMessage(p: Position, level: number, gainPct: number, soldQty: number, proceedsUsd: number, realizedPnlUsd: number, remainingPctAfter: number): string {
   return [
     `### 💰 TP${level} — ${p.symbol} (${pct(gainPct)})`,
     `🏹 robinhood | ${p.dexId} | \`${p.pairAddress}\``,
     `💲 Price: ${price(p.currentPrice)}  |  Sold: ${soldQty.toPrecision(8)} units`,
     `💵 Proceeds: ${usd(proceedsUsd)}`,
-    `📈 Realized: ${signedUsd(p.realizedPnlUsd)}  |  Remaining: ${remainingPct(p).toFixed(1)}%`,
+    `📈 Realized: ${signedUsd(realizedPnlUsd)}  |  Remaining: ${remainingPctAfter.toFixed(1)}%`,
   ].join("\n");
 }
 

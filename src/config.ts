@@ -40,6 +40,21 @@ export function isEntryPausedAt(now: Date, pausedHoursUtc: Set<number>): boolean
   return pausedHoursUtc.has(now.getUTCHours());
 }
 
+export function isPoolEntryBandValid(
+  poolCreatedAtMs: number,
+  liquidityUsd: number | null | undefined,
+  nowMs = Date.now(),
+): boolean {
+  if (!Number.isFinite(poolCreatedAtMs) || !Number.isFinite(nowMs)) return false;
+  if (liquidityUsd === null || liquidityUsd === undefined || !Number.isFinite(liquidityUsd)) return false;
+
+  const ageSec = (nowMs - poolCreatedAtMs) / 1000;
+  return ageSec >= config.dexPaprika.minAgeSec
+    && ageSec <= config.dexPaprika.maxAgeSec
+    && liquidityUsd >= config.dexPaprika.minLiquidityUsd
+    && liquidityUsd <= config.dexPaprika.maxLiquidityUsd;
+}
+
 const RH_EXIT: ExitProfile = {
   tp: [
     { gainPct: num("TP1_PCT", 30), sellPct: num("TP1_SELL_PCT", 25) },
