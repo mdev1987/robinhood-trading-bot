@@ -64,6 +64,8 @@ export class Portfolio {
   canOpen(costUsd: number): boolean { return Number.isFinite(costUsd) && costUsd > 0 && this.cash >= costUsd; }
   onOpen(costUsd: number): boolean { if (!this.canOpen(costUsd)) return false; this.cash -= costUsd; return true; }
   onProceeds(amountUsd: number): void { if (Number.isFinite(amountUsd) && amountUsd > 0) this.cash += amountUsd; }
+  /** Unconditional spend (e.g. modeled gas): paid win or lose, like on-chain. */
+  spend(amountUsd: number): void { if (Number.isFinite(amountUsd) && amountUsd > 0) this.cash -= amountUsd; }
 
   onClose(position: Position): ClosedTrade {
     const existing = this.closed.find((t) => t.id === position.id);

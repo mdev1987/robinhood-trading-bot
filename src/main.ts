@@ -45,6 +45,21 @@ function isRealizedSellEvent(e: PositionEvent): e is Extract<PositionEvent, { so
   return e.type === "TP" || e.type === "TRAIL_EXIT" || e.type === "STOP_EXIT" || e.type === "EARLY_EXIT" || e.type === "BREAKEVEN_EXIT" || e.type === "DRAIN_EXIT" || e.type === "TIME_EXIT";
 }
 
+/**
+ * Modeled on-chain gas for a paper fill, paid win or lose like live.
+ * Added to realized PnL + fee totals (so ledgers and closes carry it) and
+ * spent from paper cash. Zero by default; set PAPER_GAS_PER_FILL_USD for
+ * pessimistic paper that cannot ignore gas on small sizes.
+ */
+function applyPaperGas(p: Position, side: "ENTRY" | "EXIT"): void {
+  const gas = config.entry.gasPerFillUsd;
+  if (!(gas > 0)) return;
+  portfolio.spend(gas);
+  p.realizedPnlUsd -= gas;
+  if (side === "ENTRY") p.totalEntryFeeUsd += gas;
+  else p.totalExitFeeUsd += gas;
+}
+
 function persist(force = false): void {
   if (!config.recovery.enabled) return;
   if (!force && Date.now() - lastPersist < 10_000) return;
@@ -197,6 +212,7 @@ async function paperOpen(c: Candidate, pair: DexScreenerPair, price: number): Pr
     });
     positions.set(p.id, p);
     ledgerCosts.set(p.id, { fee: p.totalExitFeeUsd, slip: p.totalSlippageUsd });
+    applyPaperGas(p, "ENTRY");
     persist(true);
     await recordFill({
       time: Date.now(), side: "BUY", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol,
@@ -302,17 +318,19 @@ async function paperTick(p: Position, pair: DexScreenerPair): Promise<void> {
   for (const e of events) {
     if (e.type === "TP") {
       portfolio.onProceeds(e.proceedsUsd);
+      applyPaperGas(p, "EXIT");
       const prev = ledgerCosts.get(p.id) ?? { fee: 0, slip: 0 };
       const feeDelta = p.totalExitFeeUsd - prev.fee;
       const slipDelta = p.totalSlippageUsd - prev.slip;
       ledgerCosts.set(p.id, { fee: p.totalExitFeeUsd, slip: p.totalSlippageUsd });
       await recordFill({ time: now, side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol, tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress, quote: p.quoteSymbol, price: e.price, qty: e.soldQty, notionalUsd: e.proceedsUsd, feeUsd: feeDelta, slipUsd: slipDelta, detail: `TP${e.level}`, balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: portfolio.equityUsd(positions.values()) });
-      await notify(buildTpMessage(p, e.level, e.gainPct, e.soldQty, e.proceedsUsd, e.realizedPnlUsd, e.remainingPct));
+      await notify(buildTpMessage(p, e.level, e.gainPct, e.soldQty, e.proceedsUsd, e.realizedPnlUsd - config.entry.gasPerFillUsd, e.remainingPct));
     }
     if (e.type === "TRAIL_ACTIVATED") await notify(buildUpdateMessage("TRAIL", p, e.trailStop));
     if (e.type === "STOP_MOVED") await notify(buildUpdateMessage("BREAKEVEN", p, e.stopPrice));
     if (isRealizedSellEvent(e) && e.type !== "TP") {
       portfolio.onProceeds(e.proceedsUsd);
+      applyPaperGas(p, "EXIT");
       const exitLiq = pairLiquidityUsd(pair); if (exitLiq !== null) p.exitLiquidityUsd = exitLiq;
       p.balanceAfterUsd = portfolio.equityUsd([...positions.values()].filter((x) => x.id !== p.id));
       portfolio.onClose(p);
