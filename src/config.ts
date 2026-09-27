@@ -147,6 +147,9 @@ export const config = {
     // Fixed pessimism cost per paper fill (entry + each partial/final exit),
     // modeling on-chain gas that bps fees cannot express on small sizes.
     gasPerFillUsd: num("PAPER_GAS_PER_FILL_USD", 0),
+    // Flat haircut on every paper sell (confirmation lag, retry slippage,
+    // token taxes): live exits print worse than the trigger mark.
+    exitHaircutPct: num("PAPER_EXIT_HAIRCUT_PCT", 0),
     oneEntryPerPool: bool("ONE_ENTRY_PER_POOL", true),
     confirmEnabled: bool("ENTRY_CONFIRM_ENABLED", true),
     confirmDelayMs: num("ENTRY_CONFIRM_DELAY_MS", 3_000),
@@ -236,6 +239,7 @@ if (!Number.isInteger(config.entry.maxSameSymbolOpen) || config.entry.maxSameSym
 if (config.entry.positionSizeUsd <= 0 || config.entry.positionSizeUsd > config.portfolio.initialBalanceUsd) throw new Error("POSITION_SIZE_USD invalid");
 if (config.entry.confirmDelayMs <= 0 || config.entry.confirmMaxPriceDropPct <= 0 || config.entry.confirmMaxLiqDropPct <= 0) throw new Error("Invalid confirmation config");
 if (!(config.entry.gasPerFillUsd >= 0)) throw new Error("PAPER_GAS_PER_FILL_USD must be >= 0");
+if (!(config.entry.exitHaircutPct >= 0) || config.entry.exitHaircutPct > 100) throw new Error("PAPER_EXIT_HAIRCUT_PCT must be 0..100");
 if (config.stops.initialPct <= config.earlyStop.stopPct || config.earlyStop.stopPct <= 0) throw new Error("Early stop must be positive and tighter than initial stop");
 if (config.stops.trailActivationPct <= 0 || config.stops.trailDistancePct <= 0) throw new Error("Invalid trailing stop config");
 if (config.risk.maxDailyLiveLossUsd <= 0) throw new Error("MAX_DAILY_LIVE_LOSS_USD must be positive");
