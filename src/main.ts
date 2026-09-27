@@ -244,11 +244,16 @@ async function paperOpen(c: Candidate, pair: DexScreenerPair, price: number): Pr
   }
 }
 
-async function probeBuyQuote(c: Candidate, pair: DexScreenerPair, price: number, sizeUsd: number): Promise<{ ok: true; source: string; deviationPct: number } | { ok: false; reason: string }> {
+async function probeBuyQuote(c: Candidate, pair: DexScreenerPair, price: number, sizeUsd: number): Promise<{ ok: true; source: string; deviationPct: number; balanceLimited: boolean } | { ok: false; reason: string }> {
   // BUY-side dry run through the exact live router (direct-V2 + 0x),
   // read-only: proves the entry could be quoted without broadcasting.
   // Returns the mark deviation using liveBuy's own math so the paper gate
   // matches the live 3% rejection exactly.
+  // Empty-wallet caveat: 0x checks the taker's balance, so with an unfunded
+  // wallet it reports "insufficient taker balance" for routes that DO exist.
+  // That is a wallet problem, not a market problem: treat it as a
+  // balance-limited pass (route exists, deviation unknown) rather than a
+  // skip. Funding the wallet makes probes exact automatically.
   const started = Date.now();
   const base = {
     time: started, positionId: c.key, chain: CHAIN, side: "BUY" as const,
@@ -273,11 +278,17 @@ async function probeBuyQuote(c: Candidate, pair: DexScreenerPair, price: number,
     const deviation = Math.abs(quotedValueUsd / sizeUsd - 1) * 100;
     await recordQuoteCheck({ ...base, source: quote.source, quotedSellAmount: quote.sellAmount, quotedBuyAmount: quote.buyAmount, buyDecimals: decimals, note: `quotable latencyMs=${Date.now() - started}; impact=${quote.priceImpactPct ?? "unknown"}; deviation=${Number.isFinite(deviation) ? deviation.toFixed(2) : "?"}%` });
     if (!Number.isFinite(deviation) || deviation > config.safety.quoteDeviationPct) return { ok: false, reason: `deviates ${Number.isFinite(deviation) ? deviation.toFixed(2) : "?"}%` };
-    return { ok: true, source: quote.source, deviationPct: deviation };
+    return { ok: true, source: quote.source, deviationPct: deviation, balanceLimited: false };
   } catch (error) {
-    const note = `unindexed: ${String(error).slice(0, 160)}`;
+    const msg = String(error);
+    if (/insufficient taker balance/i.test(msg)) {
+      const note = `balance-limited: route exists but taker wallet is empty; deviation unknown`;
+      await recordQuoteCheck({ ...base, source: "0x-balance-limited", note });
+      return { ok: true, source: "0x-balance-limited", deviationPct: NaN, balanceLimited: true };
+    }
+    const note = `unindexed: ${msg.slice(0, 160)}`;
     await recordQuoteCheck({ ...base, source: "none", note });
-    return { ok: false, reason: String(error).slice(0, 120) };
+    return { ok: false, reason: msg.slice(0, 120) };
   }
 }
 
@@ -330,9 +341,16 @@ async function probeSellQuotability(p: Position, pair: DexScreenerPair, soldQtyU
       sellDecimals: decimals, note: `${label} quotable latencyMs=${Date.now() - started}; impact=${quote.priceImpactPct ?? "unknown"}; deviation=${Number.isFinite(deviation) ? deviation.toFixed(2) : "?" }%`,
     });
   } catch (error) {
-    const note = `${label} unindexed: ${String(error).slice(0, 140)}`;
+    const msg = String(error);
+    if (/insufficient taker balance/i.test(msg)) {
+      const note = `${label} balance-limited: route exists but taker wallet is empty`;
+      await recordQuoteCheck({ ...base, source: "0x-balance-limited", note });
+      log(`⚠️ SELL probe balance-limited ${p.symbol} ${label}: route exists, wallet empty`);
+      return;
+    }
+    const note = `${label} unindexed: ${msg.slice(0, 140)}`;
     await recordQuoteCheck({ ...base, source: "none", note });
-    log(`⚠️ SELL unroutable ${p.symbol} ${label}: ${String(error).slice(0, 120)}`);
+    log(`⚠️ SELL unroutable ${p.symbol} ${label}: ${msg.slice(0, 120)}`);
   }
 }
 
@@ -387,6 +405,7 @@ async function fireConfirms(): Promise<void> {
         // as liveBuy: unroutable entries are skipped, not filled at fantasy marks.
         const probe = await probeBuyQuote(item.candidate, pair, secondPrice, config.entry.positionSizeUsd);
         if (!probe.ok) { log(`⏭️ skip entry ${item.candidate.tokenSymbol}: buy probe failed (${probe.reason})`); continue; }
+        if (probe.balanceLimited) log(`⚠️ entry ${item.candidate.tokenSymbol}: probe balance-limited, deviation gate skipped until wallet funded`);
         await paperOpen(item.candidate, pair, secondPrice);
       }
     } else {
