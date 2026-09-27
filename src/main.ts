@@ -1,4 +1,4 @@
-import { config, isEntryPausedAt, isEthVenueQuote, isPoolEntryBandValid, RH, robinhoodExitProfile } from "./config.ts";
+import { config, isEntryPausedAt, isEthVenueQuote, isPoolEntryBandValid, NATIVE, RH, robinhoodExitProfile } from "./config.ts";
 import { fetchNewestPools } from "./dexpaprika.ts";
 import { assessConfirmation, getPair, getPairsByChain, parsePrice, pairLiquidityUsd } from "./dexscreener.ts";
 import { openPosition, updatePosition } from "./position.ts";
@@ -20,8 +20,8 @@ import {
   syncLiveStrategyState, flushLiveState, getLivePosition, finalizeLivePosition,
   liveCashUsd, latchHalt, applyConfirmedLiveSell,
 } from "./live.ts";
-import { traderAddress } from "./execution/evm/viem-client.ts";
-import { quote0x } from "./execution/evm/zeroex.ts";
+import { getEvmPublicClient, traderAddress } from "./execution/evm/viem-client.ts";
+import { getBestExecutableQuote, makeQuoteRequest } from "./execution/router.ts";
 import { runLiveSmokeTest } from "./live-test.ts";
 
 const CHAIN = RH.chain;
@@ -231,6 +231,8 @@ async function paperOpen(c: Candidate, pair: DexScreenerPair, price: number): Pr
 }
 
 async function probeQuotability(c: Candidate, pair: DexScreenerPair, price: number, sizeUsd: number): Promise<void> {
+  // BUY-side dry run through the exact live router (direct-V2 + 0x),
+  // read-only: proves the entry could be quoted without broadcasting.
   const started = Date.now();
   const base = {
     time: started, positionId: c.key, chain: CHAIN, side: "BUY" as const,
@@ -246,12 +248,69 @@ async function probeQuotability(c: Candidate, pair: DexScreenerPair, price: numb
     let taker: string;
     try { taker = traderAddress(); } catch { await recordQuoteCheck({ ...base, source: "skipped", note: "no-trader-key" }); return; }
     const quote = await Promise.race([
-      quote0x({ chain: CHAIN, sellToken: pair.quoteToken.address, buyToken: c.tokenAddress, sellAmountBaseUnits: sellRaw.toString(), taker, slippageBps: config.live.buySlippageBps }),
+      getBestExecutableQuote(makeQuoteRequest({ sellToken: NATIVE, buyToken: c.tokenAddress, sellAmountBaseUnits: sellRaw.toString(), slippageBps: config.live.buySlippageBps, pairAddress: pair.pairAddress, taker }), "BUY"),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe timeout")), 20_000)),
     ]);
-    await recordQuoteCheck({ ...base, source: "0x", quotedSellAmount: quote.sellAmount, quotedBuyAmount: quote.buyAmount, note: `quotable latencyMs=${Date.now() - started}; impact=${quote.priceImpactPct ?? "unknown"}` });
+    await recordQuoteCheck({ ...base, source: quote.source, quotedSellAmount: quote.sellAmount, quotedBuyAmount: quote.buyAmount, buyDecimals: null, note: `quotable latencyMs=${Date.now() - started}; impact=${quote.priceImpactPct ?? "unknown"}` });
   } catch (error) {
-    await recordQuoteCheck({ ...base, source: "none", note: `unindexed: ${String(error).slice(0, 160)}` });
+    const note = `unindexed: ${String(error).slice(0, 160)}`;
+    await recordQuoteCheck({ ...base, source: "none", note });
+    log(`⚠️ BUY unroutable ${c.tokenSymbol}: ${String(error).slice(0, 120)}`);
+  }
+}
+
+const probeDecimalsCache = new Map<string, number>();
+
+async function probeTokenDecimals(tokenAddress: string): Promise<number> {
+  const key = tokenAddress.toLowerCase();
+  const cached = probeDecimalsCache.get(key);
+  if (cached !== undefined) return cached;
+  const decimals = Number(await getEvmPublicClient().readContract({
+    address: tokenAddress as `0x${string}`,
+    abi: [{ name: "decimals", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "uint8" }] }] as const,
+    functionName: "decimals",
+  }));
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 36) throw new Error("invalid token decimals");
+  probeDecimalsCache.set(key, decimals);
+  return decimals;
+}
+
+async function probeSellQuotability(p: Position, pair: DexScreenerPair, soldQtyUnits: number, label: string, markPrice: number): Promise<void> {
+  // SELL-side dry run through the exact live router, read-only: proves the
+  // exit could be quoted without broadcasting. Diagnostic only — the paper
+  // fill at mark stands regardless, but an "unindexed" row here is exactly
+  // what a live exit would hit as `No executable RH route`.
+  const started = Date.now();
+  const base = {
+    time: started, positionId: p.id, chain: CHAIN, side: "SELL" as const,
+    paperPriceUsd: markPrice, quotedSellAmount: "", quotedBuyAmount: "",
+    sellDecimals: null as number | null, buyDecimals: 18 as number | null,
+    riskPass: null as boolean | null, simOk: null as boolean | null,
+  };
+  try {
+    const ethUsd = Number(pair.priceUsd) / Number(pair.priceNative);
+    if (!(ethUsd > 0)) { await recordQuoteCheck({ ...base, source: "skipped", note: `${label}:no-eth-mark` }); return; }
+    const decimals = await probeTokenDecimals(p.tokenAddress);
+    const sellRaw = BigInt(Math.floor(soldQtyUnits * 10 ** decimals));
+    if (sellRaw <= 0n) { await recordQuoteCheck({ ...base, source: "skipped", note: `${label}:dust-size` }); return; }
+    let taker: string;
+    try { taker = traderAddress(); } catch { await recordQuoteCheck({ ...base, source: "skipped", note: `${label}:no-trader-key` }); return; }
+    const quote = await Promise.race([
+      getBestExecutableQuote(makeQuoteRequest({ sellToken: p.tokenAddress, buyToken: NATIVE, sellAmountBaseUnits: sellRaw.toString(), slippageBps: config.live.sellSlippageBps, pairAddress: pair.pairAddress, taker }), "SELL"),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe timeout")), 20_000)),
+    ]);
+    const outEth = Number(BigInt(quote.buyAmount)) / 1e18;
+    const quotedUsd = outEth * ethUsd;
+    const expectedUsd = soldQtyUnits * markPrice;
+    const deviation = expectedUsd > 0 ? Math.abs(quotedUsd / expectedUsd - 1) * 100 : NaN;
+    await recordQuoteCheck({
+      ...base, source: quote.source, quotedSellAmount: quote.sellAmount, quotedBuyAmount: quote.buyAmount,
+      sellDecimals: decimals, note: `${label} quotable latencyMs=${Date.now() - started}; impact=${quote.priceImpactPct ?? "unknown"}; deviation=${Number.isFinite(deviation) ? deviation.toFixed(2) : "?" }%`,
+    });
+  } catch (error) {
+    const note = `${label} unindexed: ${String(error).slice(0, 140)}`;
+    await recordQuoteCheck({ ...base, source: "none", note });
+    log(`⚠️ SELL unroutable ${p.symbol} ${label}: ${String(error).slice(0, 120)}`);
   }
 }
 
@@ -325,6 +384,7 @@ async function paperTick(p: Position, pair: DexScreenerPair): Promise<void> {
       ledgerCosts.set(p.id, { fee: p.totalExitFeeUsd, slip: p.totalSlippageUsd });
       await recordFill({ time: now, side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol, tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress, quote: p.quoteSymbol, price: e.price, qty: e.soldQty, notionalUsd: e.proceedsUsd, feeUsd: feeDelta, slipUsd: slipDelta, detail: `TP${e.level}`, balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: portfolio.equityUsd(positions.values()) });
       await notify(buildTpMessage(p, e.level, e.gainPct, e.soldQty, e.proceedsUsd, e.realizedPnlUsd - config.entry.gasPerFillUsd, e.remainingPct));
+      probeSellQuotability(p, pair, e.soldQty, `TP${e.level}`, e.price).catch((err) => log(`⚠️ sell probe failed: ${String(err).slice(0, 120)}`));
     }
     if (e.type === "TRAIL_ACTIVATED") await notify(buildUpdateMessage("TRAIL", p, e.trailStop));
     if (e.type === "STOP_MOVED") await notify(buildUpdateMessage("BREAKEVEN", p, e.stopPrice));
@@ -340,6 +400,7 @@ async function paperTick(p: Position, pair: DexScreenerPair): Promise<void> {
       await recordFill({ time: now, side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol, tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress, quote: p.quoteSymbol, price: e.price, qty: e.soldQty, notionalUsd: e.proceedsUsd, feeUsd: p.totalExitFeeUsd - prev.fee, slipUsd: p.totalSlippageUsd - prev.slip, detail: e.type, balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: p.balanceAfterUsd ?? portfolio.cashUsd });
       await recordTrade(tradeRecordFromPosition(p, { pnlUsd: p.realizedPnlUsd, pnlPct: p.initialUsdSize > 0 ? p.realizedPnlUsd / p.initialUsdSize * 100 : 0, balanceBeforeUsd: p.balanceBeforeUsd ?? NaN, balanceAfterUsd: p.balanceAfterUsd ?? NaN }));
       await notify(buildCloseMessage(p, portfolio.snapshot(positions.values()), portfolio.chainStat(CHAIN), portfolio.tokenPnlUsd(CHAIN, p.symbol)));
+      if (e.soldQty > 0) probeSellQuotability(p, pair, e.soldQty, e.type, e.price).catch((err) => log(`⚠️ sell probe failed: ${String(err).slice(0, 120)}`));
       persist(true); break;
     }
   }
