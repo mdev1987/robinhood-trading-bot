@@ -114,7 +114,13 @@ function entryGates(): boolean {
 
 function isAddress(value: string): boolean { return /^0x[0-9a-fA-F]{40}$/.test(value); }
 function quoteAllowed(pair: DexScreenerPair): boolean {
-  return pair.quoteToken.address.trim().toLowerCase() === RH.contracts.weth.toLowerCase()
+  const addr = pair.quoteToken.address.trim().toLowerCase();
+  const isWeth = addr === RH.contracts.weth.toLowerCase();
+  // DexScreener labels native-ETH-quoted pools with the zero address.
+  // The live engine sells into native ETH either way, so treat it as the
+  // same venue quote rather than rejecting the pool.
+  const isNativeEth = /^0x0{40}$/.test(addr);
+  return (isWeth || isNativeEth)
     && config.dexPaprika.quoteSymbols.includes(pair.quoteToken.symbol.trim().toLowerCase());
 }
 function dexAllowed(pair: DexScreenerPair): boolean { return config.dexPaprika.dexIds.includes(pair.dexId.toLowerCase()); }
