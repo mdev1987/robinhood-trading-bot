@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { config, RH, isEntryPausedAt, isPoolEntryBandValid, parseHourSet } from "../src/config.ts";
+import { config, RH, isEntryPausedAt, isEthVenueQuote, isPoolEntryBandValid, parseHourSet } from "../src/config.ts";
 
 test("Robinhood config is single-chain", () => {
   expect(RH.chain).toBe("robinhood");
@@ -26,4 +26,12 @@ test("final pool entry band is inclusive at the configured boundaries", () => {
   expect(isPoolEntryBandValid(now - config.dexPaprika.maxAgeSec * 1000, config.dexPaprika.maxLiquidityUsd, now)).toBe(true);
   expect(isPoolEntryBandValid(now - (config.dexPaprika.maxAgeSec + 1) * 1000, config.dexPaprika.minLiquidityUsd, now)).toBe(false);
   expect(isPoolEntryBandValid(now - config.dexPaprika.minAgeSec * 1000, config.dexPaprika.minLiquidityUsd - 1, now)).toBe(false);
+});
+
+test("venue quote accepts canonical WETH and native zero address only", () => {
+  expect(isEthVenueQuote(RH.contracts.weth)).toBe(true);
+  expect(isEthVenueQuote("0x0000000000000000000000000000000000000000")).toBe(true);
+  expect(isEthVenueQuote("0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168")).toBe(false);
+  expect(isEthVenueQuote("")).toBe(false);
+  expect(isEthVenueQuote(null)).toBe(false);
 });

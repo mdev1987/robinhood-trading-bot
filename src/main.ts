@@ -1,4 +1,4 @@
-import { config, isEntryPausedAt, isPoolEntryBandValid, RH, robinhoodExitProfile } from "./config.ts";
+import { config, isEntryPausedAt, isEthVenueQuote, isPoolEntryBandValid, RH, robinhoodExitProfile } from "./config.ts";
 import { fetchNewestPools } from "./dexpaprika.ts";
 import { assessConfirmation, getPair, getPairsByChain, parsePrice, pairLiquidityUsd } from "./dexscreener.ts";
 import { openPosition, updatePosition } from "./position.ts";
@@ -114,13 +114,7 @@ function entryGates(): boolean {
 
 function isAddress(value: string): boolean { return /^0x[0-9a-fA-F]{40}$/.test(value); }
 function quoteAllowed(pair: DexScreenerPair): boolean {
-  const addr = pair.quoteToken.address.trim().toLowerCase();
-  const isWeth = addr === RH.contracts.weth.toLowerCase();
-  // DexScreener labels native-ETH-quoted pools with the zero address.
-  // The live engine sells into native ETH either way, so treat it as the
-  // same venue quote rather than rejecting the pool.
-  const isNativeEth = /^0x0{40}$/.test(addr);
-  return (isWeth || isNativeEth)
+  return isEthVenueQuote(pair.quoteToken.address)
     && config.dexPaprika.quoteSymbols.includes(pair.quoteToken.symbol.trim().toLowerCase());
 }
 function dexAllowed(pair: DexScreenerPair): boolean { return config.dexPaprika.dexIds.includes(pair.dexId.toLowerCase()); }

@@ -55,6 +55,17 @@ export function isPoolEntryBandValid(
     && liquidityUsd <= config.dexPaprika.maxLiquidityUsd;
 }
 
+/**
+ * Shared venue-quote rule for paper discovery and live entries.
+ * DexScreener labels native-ETH-quoted pools with the zero address; the
+ * execution engine sells into native ETH either way, so both count as the
+ * same ETH venue quote. Symbol allowlist still applies at the call site.
+ */
+export function isEthVenueQuote(address: string | null | undefined): boolean {
+  const addr = (address ?? "").trim().toLowerCase();
+  return addr === RH.contracts.weth.toLowerCase() || /^0x0{40}$/.test(addr);
+}
+
 const RH_EXIT: ExitProfile = {
   tp: [
     { gainPct: num("TP1_PCT", 30), sellPct: num("TP1_SELL_PCT", 25) },

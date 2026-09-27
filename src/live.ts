@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Candidate, DexScreenerPair, ExecutionResult, LiveOrder, LivePosition, LiveStrategyState, Position, Quote } from "./types.ts";
-import { config, RH, NATIVE, robinhoodExitProfile } from "./config.ts";
+import { config, RH, NATIVE, isEthVenueQuote, robinhoodExitProfile } from "./config.ts";
 import { getBestExecutableQuote, makeQuoteRequest } from "./execution/router.ts";
 import { executeQuote, extractExecutionAmounts, gasUsdFromExecution, isNative, tokenBalance } from "./execution/evm/live.ts";
 import { assertRobinhoodInfrastructure, getEvmPublicClient, traderAccount, traderAddress } from "./execution/evm/viem-client.ts";
@@ -383,7 +383,7 @@ export async function initLive(log: (msg: string) => void): Promise<void> {
 
 export async function liveBuy(candidate: Candidate, pair: DexScreenerPair, sizeUsd: number): Promise<{ position: Position; live: LivePosition; quote: Quote; executionHash: string }> {
   if (!liveEntryAllowed()) throw new Error("RH live entry gate is closed");
-  if (pair.quoteToken.address.toLowerCase() !== RH.contracts.weth.toLowerCase()) throw new Error("RH live BUY requires canonical WETH pair");
+  if (!isEthVenueQuote(pair.quoteToken.address)) throw new Error("RH live BUY requires a WETH/native-ETH venue quote");
   const ethUsd = ethUsdFromPair(pair); if (ethUsd === null) throw new Error("cannot derive ETH/USD");
   const sellAmount = usdToEthRaw(sizeUsd, ethUsd);
   const quote = await getBestExecutableQuote(makeQuoteRequest({ sellToken: NATIVE, buyToken: candidate.tokenAddress, sellAmountBaseUnits: sellAmount, slippageBps: config.live.buySlippageBps, pairAddress: pair.pairAddress }), "BUY");
