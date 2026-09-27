@@ -1,7 +1,7 @@
 import type { Quote, QuoteRequest } from "../../types.ts";
 import { RH, config } from "../../config.ts";
 
-const BASE = "https://api.0x.org/swap/allowance-holder";
+const BASE = "https://api.0x.org/swap/allowance-holder/quote";
 const EEEE = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
 
 interface ZeroExResponse {
