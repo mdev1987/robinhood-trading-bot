@@ -10,7 +10,7 @@ import {
 } from "./analytics.ts";
 import { telegram, testTelegram } from "./telegram.ts";
 import { buildBuyMessage, buildCloseMessage, buildLiveClosedMessage, buildStartupMessage, buildTpMessage, buildUpdateMessage } from "./report.ts";
-import type { Candidate, DexScreenerPair, Position } from "./types.ts";
+import type { Candidate, DexScreenerPair, Position, Quote } from "./types.ts";
 import type { PositionEvent } from "./position.ts";
 import { recentStopCount, rollingExpectancyNegative, paperLossLimitBreached, isRepeatSymbol } from "./breakers.ts";
 import { claimInstanceLockForStateFile } from "./instance-lock.ts";
@@ -68,8 +68,8 @@ function applyExitHaircut(p: Position, proceedsUsd: number): number {
  * spent from paper cash. Zero by default; set PAPER_GAS_PER_FILL_USD for
  * pessimistic paper that cannot ignore gas on small sizes.
  */
-function applyPaperGas(p: Position, side: "ENTRY" | "EXIT"): void {
-  const gas = config.entry.gasPerFillUsd;
+function applyPaperGas(p: Position, side: "ENTRY" | "EXIT", amountUsd = config.entry.gasPerFillUsd): void {
+  const gas = amountUsd;
   if (!(gas > 0)) return;
   portfolio.spend(gas);
   p.realizedPnlUsd -= gas;
@@ -215,15 +215,83 @@ async function discover(): Promise<void> {
   log(`🔎 discovery cycle complete in ${Date.now() - started}ms; pools=${pools.length} pairs=${pairs.length} queued=${queued} pendingConfirm=${pendingConfirms.size}`);
 }
 
-async function paperOpen(c: Candidate, pair: DexScreenerPair, price: number): Promise<void> {
-  if (!portfolio.onOpen(config.entry.positionSizeUsd)) return;
+async function paperOpen(
+  c: Candidate,
+  pair: DexScreenerPair,
+  price: number,
+  exec: { quote: Quote; decimals: number; ethUsd: number; deviationPct: number } | null,
+): Promise<void> {
+  // Live-shadow fill: when an executable quote is available, the fill uses
+  // the QUOTED output (buyAmount/minBuyAmount) and estimated gas exactly as
+  // liveBuy would execute it — no mark fill, no fixed slippage assumption.
+  // Without a quote (balance-limited probe), falls back to the legacy mark
+  // fill with the fixed pessimism stack.
+  const sizeUsd = config.entry.positionSizeUsd;
+  const quoteGas = exec ? await paperExecGasUsd(exec.quote, exec.ethUsd) : config.entry.gasPerFillUsd;
+  if (!portfolio.canOpen(sizeUsd + quoteGas)) return;
+  if (!portfolio.onOpen(sizeUsd)) return;
   try {
     const entryLiq = pairLiquidityUsd(pair);
+    if (exec) {
+      const buyRaw = BigInt(exec.quote.buyAmount);
+      const tokenQty = Number(buyRaw) / 10 ** exec.decimals;
+      const minRaw = exec.quote.minBuyAmount !== undefined ? BigInt(exec.quote.minBuyAmount) : 0n;
+      if (!(tokenQty > 0) || buyRaw < minRaw) {
+        portfolio.onProceeds(sizeUsd);
+        log(`⏭️ skip entry ${c.tokenSymbol}: simulated min-output revert`);
+        return;
+      }
+      const sellEth = Number(BigInt(exec.quote.sellAmount)) / 1e18;
+      const costUsd = sellEth * exec.ethUsd;
+      if (!(costUsd > 0)) {
+        portfolio.onProceeds(sizeUsd);
+        log(`⏭️ skip entry ${c.tokenSymbol}: simulated fill cannot be valued`);
+        return;
+      }
+      const bpsFee = costUsd * (config.entry.feeEntryBps / 10_000);
+      const p = openPosition({
+        id: c.key, chain: CHAIN, pairAddress: c.pairAddress, tokenAddress: c.tokenAddress,
+        symbol: c.tokenSymbol, tokenName: c.tokenName, quoteSymbol: pair.quoteToken.symbol,
+        dexId: pair.dexId, ...(pair.url ? { pairUrl: pair.url } : {}), marketPrice: costUsd / tokenQty,
+        usdSize: costUsd, balanceBeforeUsd: portfolio.cashUsd + sizeUsd + quoteGas,
+        poolAddress: c.poolAddress, ...(entryLiq !== null ? { entryLiquidityUsd: entryLiq } : {}),
+        entryAgeSec: ageSec(c.poolCreatedAt), exitProfile: robinhoodExitProfile(),
+      });
+      // Lock the quoted fill over the mark fill, mirroring liveBuy's receipt
+      // rebuild: quantity, price, and costs come from the executable quote.
+      p.quantity = tokenQty;
+      p.originalQuantity = tokenQty;
+      p.initialUsdSize = costUsd;
+      p.entryPrice = costUsd / tokenQty;
+      p.currentPrice = p.entryPrice;
+      p.highestPrice = p.entryPrice;
+      p.lowestPrice = p.entryPrice;
+      p.realizedPnlUsd = -(bpsFee + quoteGas);
+      p.totalEntryFeeUsd = bpsFee + quoteGas;
+      p.totalSlippageUsd = 0;
+      positions.set(p.id, p);
+      ledgerCosts.set(p.id, { fee: p.totalExitFeeUsd, slip: p.totalSlippageUsd });
+      portfolio.spend(quoteGas);
+      // onOpen took sizeUsd but the quoted spend is costUsd: settle the difference.
+      if (costUsd > sizeUsd) portfolio.spend(costUsd - sizeUsd);
+      else portfolio.onProceeds(sizeUsd - costUsd);
+      persist(true);
+      await recordFill({
+        time: Date.now(), side: "BUY", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol,
+        tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress,
+        quote: p.quoteSymbol, price: p.entryPrice, qty: p.quantity, notionalUsd: p.initialUsdSize,
+        feeUsd: p.totalEntryFeeUsd, slipUsd: p.totalSlippageUsd, detail: `paper:${exec.quote.source}:dev${exec.deviationPct.toFixed(2)}`,
+        balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: portfolio.equityUsd(positions.values()),
+      });
+      await notify(buildBuyMessage(p, config.entry.maxOpenPositions, openCount(), p.balanceBeforeUsd, portfolio.cashUsd));
+      log(`💰 paper BUY ${p.symbol} entry=${p.entryPrice} qty=${p.quantity} open=${openCount()}/${config.entry.maxOpenPositions}`);
+      return;
+    }
     const p = openPosition({
       id: c.key, chain: CHAIN, pairAddress: c.pairAddress, tokenAddress: c.tokenAddress,
       symbol: c.tokenSymbol, tokenName: c.tokenName, quoteSymbol: pair.quoteToken.symbol,
       dexId: pair.dexId, ...(pair.url ? { pairUrl: pair.url } : {}), marketPrice: price,
-      usdSize: config.entry.positionSizeUsd, balanceBeforeUsd: portfolio.cashUsd + config.entry.positionSizeUsd,
+      usdSize: sizeUsd, balanceBeforeUsd: portfolio.cashUsd + sizeUsd,
       poolAddress: c.poolAddress, ...(entryLiq !== null ? { entryLiquidityUsd: entryLiq } : {}),
       entryAgeSec: ageSec(c.poolCreatedAt), exitProfile: robinhoodExitProfile(),
     });
@@ -246,7 +314,11 @@ async function paperOpen(c: Candidate, pair: DexScreenerPair, price: number): Pr
   }
 }
 
-async function probeBuyQuote(c: Candidate, pair: DexScreenerPair, price: number, sizeUsd: number): Promise<{ ok: true; source: string; deviationPct: number; balanceLimited: boolean } | { ok: false; reason: string }> {
+async function probeBuyQuote(c: Candidate, pair: DexScreenerPair, price: number, sizeUsd: number): Promise<
+  | { ok: true; quoted: true; quote: Quote; decimals: number; ethUsd: number; deviationPct: number }
+  | { ok: true; quoted: false; balanceLimited: true }
+  | { ok: false; reason: string }
+> {
   // BUY-side dry run through the exact live router (direct-V2 + 0x),
   // read-only: proves the entry could be quoted without broadcasting.
   // Returns the mark deviation using liveBuy's own math so the paper gate
@@ -280,18 +352,41 @@ async function probeBuyQuote(c: Candidate, pair: DexScreenerPair, price: number,
     const deviation = Math.abs(quotedValueUsd / sizeUsd - 1) * 100;
     await recordQuoteCheck({ ...base, source: quote.source, quotedSellAmount: quote.sellAmount, quotedBuyAmount: quote.buyAmount, buyDecimals: decimals, note: `quotable latencyMs=${Date.now() - started}; impact=${quote.priceImpactPct ?? "unknown"}; deviation=${Number.isFinite(deviation) ? deviation.toFixed(2) : "?"}%` });
     if (!Number.isFinite(deviation) || deviation > config.safety.quoteDeviationPct) return { ok: false, reason: `deviates ${Number.isFinite(deviation) ? deviation.toFixed(2) : "?"}%` };
-    return { ok: true, source: quote.source, deviationPct: deviation, balanceLimited: false };
+    return { ok: true, quoted: true, quote, decimals, ethUsd, deviationPct: deviation };
   } catch (error) {
     const msg = String(error);
     if (/insufficient taker balance/i.test(msg)) {
       const note = `balance-limited: route exists but taker wallet is empty; deviation unknown`;
       await recordQuoteCheck({ ...base, source: "0x-balance-limited", note });
-      return { ok: true, source: "0x-balance-limited", deviationPct: NaN, balanceLimited: true };
+      return { ok: true, quoted: false, balanceLimited: true };
     }
     const note = `unindexed: ${msg.slice(0, 160)}`;
     await recordQuoteCheck({ ...base, source: "none", note });
     return { ok: false, reason: msg.slice(0, 120) };
   }
+}
+
+/** Live-style gas estimate for a quote (read-only). Null when unestimable. */
+async function estimateExecGasUsd(quote: Quote, ethUsd: number): Promise<number | null> {
+  try {
+    if (!(ethUsd > 0)) return null;
+    const client = getEvmPublicClient();
+    const units = await client.estimateGas({
+      account: traderAddress(),
+      to: quote.to as `0x${string}`,
+      data: quote.calldata as `0x${string}`,
+      value: BigInt(quote.value || "0"),
+    });
+    const gasPrice = BigInt(await client.getGasPrice());
+    const usd = Number(BigInt(units) * gasPrice) / 1e18 * ethUsd;
+    return Number.isFinite(usd) && usd >= 0 ? usd : null;
+  } catch { return null; }
+}
+
+/** Pessimistic gas: live estimate floored at the fixed paper model. */
+async function paperExecGasUsd(quote: Quote, ethUsd: number): Promise<number> {
+  const est = await estimateExecGasUsd(quote, ethUsd);
+  return est === null ? config.entry.gasPerFillUsd : Math.max(est, config.entry.gasPerFillUsd);
 }
 
 const probeDecimalsCache = new Map<string, number>();
@@ -310,11 +405,18 @@ async function probeTokenDecimals(tokenAddress: string): Promise<number> {
   return decimals;
 }
 
-async function probeSellQuotability(p: Position, pair: DexScreenerPair, soldQtyUnits: number, label: string, markPrice: number): Promise<void> {
-  // SELL-side dry run through the exact live router, read-only: proves the
-  // exit could be quoted without broadcasting. Diagnostic only — the paper
-  // fill at mark stands regardless, but an "unindexed" row here is exactly
-  // what a live exit would hit as `No executable RH route`.
+/**
+ * Paper SELL execution through the live router (read-only): returns quoted
+ * output + estimated gas so paper exits fill exactly what live would
+ * execute, mirroring the live 300→400bps retry escalation (two attempts).
+ * Never broadcasts. Falls back to mark fills only when unquotable.
+ */
+type SellExec =
+  | { status: "quoted"; quote: Quote; proceedsUsd: number; gasUsd: number; deviationPct: number; attempts: number }
+  | { status: "balance-limited" }
+  | { status: "unavailable"; reason: string };
+
+async function quoteSellExec(p: Position, pair: DexScreenerPair, soldQtyUnits: number, label: string, markPrice: number): Promise<SellExec> {
   const started = Date.now();
   const base = {
     time: started, positionId: p.id, chain: CHAIN, side: "SELL" as const,
@@ -322,37 +424,59 @@ async function probeSellQuotability(p: Position, pair: DexScreenerPair, soldQtyU
     sellDecimals: null as number | null, buyDecimals: 18 as number | null,
     riskPass: null as boolean | null, simOk: null as boolean | null,
   };
+  const fail = async (reason: string): Promise<SellExec> => {
+    await recordQuoteCheck({ ...base, source: "none", note: `${label} unindexed: ${reason.slice(0, 140)}` });
+    return { status: "unavailable", reason };
+  };
   try {
     const ethUsd = Number(pair.priceUsd) / Number(pair.priceNative);
-    if (!(ethUsd > 0)) { await recordQuoteCheck({ ...base, source: "skipped", note: `${label}:no-eth-mark` }); return; }
+    if (!(ethUsd > 0)) { await recordQuoteCheck({ ...base, source: "skipped", note: `${label}:no-eth-mark` }); return fail("no-eth-mark"); }
     const decimals = await probeTokenDecimals(p.tokenAddress);
     const sellRaw = BigInt(Math.floor(soldQtyUnits * 10 ** decimals));
-    if (sellRaw <= 0n) { await recordQuoteCheck({ ...base, source: "skipped", note: `${label}:dust-size` }); return; }
+    if (sellRaw <= 0n) { await recordQuoteCheck({ ...base, source: "skipped", note: `${label}:dust-size` }); return fail("dust-size"); }
     let taker: string;
-    try { taker = traderAddress(); } catch { await recordQuoteCheck({ ...base, source: "skipped", note: `${label}:no-trader-key` }); return; }
-    const quote = await Promise.race([
-      getBestExecutableQuote(makeQuoteRequest({ sellToken: p.tokenAddress, buyToken: NATIVE, sellAmountBaseUnits: sellRaw.toString(), slippageBps: config.live.sellSlippageBps, pairAddress: pair.pairAddress, taker }), "SELL"),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe timeout")), 20_000)),
-    ]);
-    const outEth = Number(BigInt(quote.buyAmount)) / 1e18;
-    const quotedUsd = outEth * ethUsd;
-    const expectedUsd = soldQtyUnits * markPrice;
-    const deviation = expectedUsd > 0 ? Math.abs(quotedUsd / expectedUsd - 1) * 100 : NaN;
-    await recordQuoteCheck({
-      ...base, source: quote.source, quotedSellAmount: quote.sellAmount, quotedBuyAmount: quote.buyAmount,
-      sellDecimals: decimals, note: `${label} quotable latencyMs=${Date.now() - started}; impact=${quote.priceImpactPct ?? "unknown"}; deviation=${Number.isFinite(deviation) ? deviation.toFixed(2) : "?" }%`,
-    });
-  } catch (error) {
-    const msg = String(error);
-    if (/insufficient taker balance/i.test(msg)) {
-      const note = `${label} balance-limited: route exists but taker wallet is empty`;
-      await recordQuoteCheck({ ...base, source: "0x-balance-limited", note });
-      log(`⚠️ SELL probe balance-limited ${p.symbol} ${label}: route exists, wallet empty`);
-      return;
+    try { taker = traderAddress(); } catch { await recordQuoteCheck({ ...base, source: "skipped", note: `${label}:no-trader-key` }); return fail("no-trader-key"); }
+    const baseBps = config.live.sellSlippageBps;
+    const escalated = Math.min(Math.ceil(baseBps * 4 / 3), config.live.sellMaxSlippageBps);
+    const steps = escalated > baseBps ? [baseBps, escalated] : [baseBps];
+    let lastError = "no route";
+    for (let i = 0; i < steps.length; i++) {
+      const slip = steps[i]!;
+      try {
+        const quote = await Promise.race([
+          getBestExecutableQuote(makeQuoteRequest({ sellToken: p.tokenAddress, buyToken: NATIVE, sellAmountBaseUnits: sellRaw.toString(), slippageBps: slip, pairAddress: pair.pairAddress, taker }), "SELL"),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe timeout")), 12_000)),
+        ]);
+        const outEth = Number(BigInt(quote.buyAmount)) / 1e18;
+        const quotedUsd = outEth * ethUsd;
+        const expectedUsd = soldQtyUnits * markPrice;
+        const deviation = expectedUsd > 0 ? Math.abs(quotedUsd / expectedUsd - 1) * 100 : NaN;
+        await recordQuoteCheck({
+          ...base, source: quote.source, quotedSellAmount: quote.sellAmount, quotedBuyAmount: quote.buyAmount,
+          sellDecimals: decimals, note: `${label}@${slip} quotable attempt=${i + 1} latencyMs=${Date.now() - started}; impact=${quote.priceImpactPct ?? "unknown"}; deviation=${Number.isFinite(deviation) ? deviation.toFixed(2) : "?"}%`,
+        });
+        if (!Number.isFinite(deviation) || deviation > config.safety.quoteDeviationPct) {
+          lastError = `deviates ${Number.isFinite(deviation) ? deviation.toFixed(2) : "?"}%`;
+          log(`⚠️ SELL quote deviates ${p.symbol} ${label}@${slip}: ${lastError}`);
+          continue;
+        }
+        const gas = await paperExecGasUsd(quote, ethUsd);
+        return { status: "quoted", quote, proceedsUsd: quotedUsd, gasUsd: gas, deviationPct: deviation, attempts: i + 1 };
+      } catch (error) {
+        const msg = String(error);
+        if (/insufficient taker balance/i.test(msg)) {
+          await recordQuoteCheck({ ...base, source: "0x-balance-limited", note: `${label} balance-limited: route exists but taker wallet is empty` });
+          log(`⚠️ SELL probe balance-limited ${p.symbol} ${label}: route exists, wallet empty`);
+          return { status: "balance-limited" };
+        }
+        lastError = msg.slice(0, 120);
+        await recordQuoteCheck({ ...base, source: "none", note: `${label}@${slip} unindexed: ${msg.slice(0, 120)}` });
+      }
     }
-    const note = `${label} unindexed: ${msg.slice(0, 140)}`;
-    await recordQuoteCheck({ ...base, source: "none", note });
-    log(`⚠️ SELL unroutable ${p.symbol} ${label}: ${msg.slice(0, 120)}`);
+    log(`⚠️ SELL unroutable ${p.symbol} ${label}: ${lastError}`);
+    return fail(lastError);
+  } catch (error) {
+    return fail(String(error).slice(0, 120));
   }
 }
 
@@ -408,8 +532,8 @@ async function fireConfirms(): Promise<void> {
         // as liveBuy: unroutable entries are skipped, not filled at fantasy marks.
         const probe = await probeBuyQuote(item.candidate, pair, secondPrice, config.entry.positionSizeUsd);
         if (!probe.ok) { log(`⏭️ skip entry ${item.candidate.tokenSymbol}: buy probe failed (${probe.reason})`); continue; }
-        if (probe.balanceLimited) log(`⚠️ entry ${item.candidate.tokenSymbol}: probe balance-limited, deviation gate skipped until wallet funded`);
-        await paperOpen(item.candidate, pair, secondPrice);
+        if (!probe.quoted) log(`⚠️ entry ${item.candidate.tokenSymbol}: probe balance-limited, deviation gate skipped until wallet funded`);
+        await paperOpen(item.candidate, pair, secondPrice, probe.quoted ? probe : null);
       }
     } else {
       try { await liveOpen(item.candidate, pair); }
@@ -427,34 +551,56 @@ async function paperTick(p: Position, pair: DexScreenerPair): Promise<void> {
   for (const e of events) {
     if (e.type === "TP") {
       const cashBefore = portfolio.cashUsd;
-      portfolio.onProceeds(e.proceedsUsd);
-      applyPaperGas(p, "EXIT");
-      applyExitHaircut(p, e.proceedsUsd);
+      // Live-shadow exit: fill at the quoted output when routable (same
+      // router + deviation gate as liveSell); otherwise fall back to the
+      // mark fill with the pessimism stack.
+      const exec = await quoteSellExec(p, pair, e.soldQty, `TP${e.level}`, e.price).catch((err): SellExec => ({ status: "unavailable", reason: String(err).slice(0, 120) }));
+      const proceeds = exec.status === "quoted" ? exec.proceedsUsd : e.proceedsUsd;
+      const gas = exec.status === "quoted" ? exec.gasUsd : config.entry.gasPerFillUsd;
+      const exitPrice = e.soldQty > 0 ? proceeds / e.soldQty : e.price;
+      portfolio.onProceeds(proceeds);
+      applyPaperGas(p, "EXIT", gas);
+      if (exec.status !== "quoted") applyExitHaircut(p, proceeds);
+      // Quoted fills replace the mark proceeds with the executable output.
+      p.realizedPnlUsd += proceeds - e.proceedsUsd;
       const prev = ledgerCosts.get(p.id) ?? { fee: 0, slip: 0 };
       const feeDelta = p.totalExitFeeUsd - prev.fee;
       const slipDelta = p.totalSlippageUsd - prev.slip;
       ledgerCosts.set(p.id, { fee: p.totalExitFeeUsd, slip: p.totalSlippageUsd });
-      await recordFill({ time: now, side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol, tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress, quote: p.quoteSymbol, price: e.price, qty: e.soldQty, notionalUsd: e.proceedsUsd, feeUsd: feeDelta, slipUsd: slipDelta, detail: `TP${e.level}`, balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: portfolio.equityUsd(positions.values()) });
-      await notify(buildTpMessage(p, e.level, e.gainPct, e.soldQty, e.proceedsUsd, e.realizedPnlUsd - config.entry.gasPerFillUsd, e.remainingPct, cashBefore, portfolio.cashUsd));
-      probeSellQuotability(p, pair, e.soldQty, `TP${e.level}`, e.price).catch((err) => log(`⚠️ sell probe failed: ${String(err).slice(0, 120)}`));
+      await recordFill({ time: now, side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol, tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress, quote: p.quoteSymbol, price: exitPrice, qty: e.soldQty, notionalUsd: proceeds, feeUsd: feeDelta, slipUsd: slipDelta, detail: `TP${e.level}${exec.status === "quoted" ? ":quoted" : ""}`, balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: portfolio.equityUsd(positions.values()) });
+      await notify(buildTpMessage(p, e.level, e.gainPct, e.soldQty, proceeds, e.realizedPnlUsd + (proceeds - e.proceedsUsd) - gas, e.remainingPct, cashBefore, portfolio.cashUsd));
     }
     if (e.type === "TRAIL_ACTIVATED") await notify(buildUpdateMessage("TRAIL", p, e.trailStop, portfolio.cashUsd));
     if (e.type === "STOP_MOVED") await notify(buildUpdateMessage("BREAKEVEN", p, e.stopPrice, portfolio.cashUsd));
     if (isRealizedSellEvent(e) && e.type !== "TP") {
       const cashBefore = portfolio.cashUsd;
-      portfolio.onProceeds(e.proceedsUsd);
-      applyPaperGas(p, "EXIT");
-      applyExitHaircut(p, e.proceedsUsd);
+      let proceeds = e.proceedsUsd;
+      let exitPrice = e.price;
+      let gas = config.entry.gasPerFillUsd;
+      let quoted = false;
+      if (e.soldQty > 0) {
+        const exec = await quoteSellExec(p, pair, e.soldQty, e.type, e.price).catch((err): SellExec => ({ status: "unavailable", reason: String(err).slice(0, 120) }));
+        if (exec.status === "quoted") {
+          quoted = true;
+          proceeds = exec.proceedsUsd;
+          gas = exec.gasUsd;
+          exitPrice = proceeds / e.soldQty;
+        }
+      }
+      portfolio.onProceeds(proceeds);
+      applyPaperGas(p, "EXIT", gas);
+      if (!quoted) applyExitHaircut(p, proceeds);
+      // Quoted fills replace the mark proceeds with the executable output.
+      p.realizedPnlUsd += proceeds - e.proceedsUsd;
       const exitLiq = pairLiquidityUsd(pair); if (exitLiq !== null) p.exitLiquidityUsd = exitLiq;
       p.balanceAfterUsd = portfolio.equityUsd([...positions.values()].filter((x) => x.id !== p.id));
       portfolio.onClose(p);
       positions.delete(p.id); lastSnapshotAt.delete(p.id);
       const prev = ledgerCosts.get(p.id) ?? { fee: p.totalEntryFeeUsd, slip: 0 };
       ledgerCosts.delete(p.id);
-      await recordFill({ time: now, side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol, tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress, quote: p.quoteSymbol, price: e.price, qty: e.soldQty, notionalUsd: e.proceedsUsd, feeUsd: p.totalExitFeeUsd - prev.fee, slipUsd: p.totalSlippageUsd - prev.slip, detail: e.type, balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: p.balanceAfterUsd ?? portfolio.cashUsd });
+      await recordFill({ time: now, side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol, tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress, quote: p.quoteSymbol, price: exitPrice, qty: e.soldQty, notionalUsd: proceeds, feeUsd: p.totalExitFeeUsd - prev.fee, slipUsd: p.totalSlippageUsd - prev.slip, detail: `${e.type}${quoted ? ":quoted" : ""}`, balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: p.balanceAfterUsd ?? portfolio.cashUsd });
       await recordTrade(tradeRecordFromPosition(p, { pnlUsd: p.realizedPnlUsd, pnlPct: p.initialUsdSize > 0 ? p.realizedPnlUsd / p.initialUsdSize * 100 : 0, balanceBeforeUsd: p.balanceBeforeUsd ?? NaN, balanceAfterUsd: p.balanceAfterUsd ?? NaN }));
       await notify(buildCloseMessage(p, portfolio.snapshot(positions.values()), portfolio.chainStat(CHAIN), portfolio.tokenPnlUsd(CHAIN, p.symbol)));
-      if (e.soldQty > 0) probeSellQuotability(p, pair, e.soldQty, e.type, e.price).catch((err) => log(`⚠️ sell probe failed: ${String(err).slice(0, 120)}`));
       persist(true); break;
     }
   }

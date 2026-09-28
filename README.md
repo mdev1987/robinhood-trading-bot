@@ -84,8 +84,9 @@ Set `AUTO_ENTRY=true` for the actual paper strategy.
 Paper is deliberately harsher than live:
 
 - Paper entries clear the same live-router quote + 3% deviation gate as live buys (read-only, never broadcast). Unroutable entries are skipped, not filled at fantasy marks. With an unfunded wallet, 0x reports `insufficient taker balance`; the probe records `0x-balance-limited` and passes (route exists, deviation unknown) with a warning instead of skipping.
-- Every paper sell probes the live router read-only and records route + mark deviation into `quote_checks`. Fills still print at mark; the probe is diagnostic.
-- Costs: configurable bps fees/slippage per side plus a fixed `PAPER_GAS_PER_FILL_USD` per fill and a `PAPER_EXIT_HAIRCUT_PCT` haircut on every sell (confirmation lag, retry slippage, taxes), all booked into cash, realized PnL, and fee/slippage totals.
+- Paper BUYs fill at the **quoted output** (`buyAmount`, `minBuyAmount`-checked) with live-style estimated gas floored at the fixed model — no mark fill, no fixed-slippage assumption. Without a quote, entries fall back to the mark fill with the pessimism stack.
+- Every paper sell quotes the live router first (with one slippage-escalated retry) and fills at the **quoted output**; only unquotable exits fall back to mark + haircut. Quote rows land in `quote_checks`.
+- Costs: configurable bps fees/slippage per side plus a fixed `PAPER_GAS_PER_FILL_USD` per fill and a `PAPER_EXIT_HAIRCUT_PCT` haircut on fallback (mark) sells, all booked into cash, realized PnL, and fee/slippage totals.
 - Every Telegram message carries a `💰 Balance: before → after` leg.
 
 A 5-minute WAL checkpoint keeps external DuckDB copies fresh. Unit tests pin the research regime (`bun run test` sets the band + zero friction); raw `bun test` follows the operator `.env` instead.
