@@ -9,10 +9,11 @@ The production configuration preserves the observed Robinhood paper regime:
 - DexPaprika discovery using cursor pagination, sorted by pool creation time.
 - Eligible pool age: 60–120 seconds.
 - Liquidity: $15,000–$100,000.
-- Quote token: canonical Robinhood WETH.
+- Quote token: WETH plus native-ETH-quoted pools (zero address on DexScreener), treated as the same venue quote because execution sells into native ETH.
 - DEX: Uniswap.
 - DexScreener is the market-data/exit mark at 1 second.
 - 3-second confirmation; material price/liquidity deterioration rejects the entry.
+- Final band gate: age + liquidity are rechecked on the confirmation print, so entries that aged out during confirmation are skipped in paper and live alike.
 - One entry per pool, one open position per symbol, maximum 3 open positions.
 - TP1 +30% / 25%, TP2 +60% / 25%, TP3 +100% / 25%, remaining 25% is the runner.
 - Early stop -10% for 180 seconds, initial stop -15%.
@@ -80,6 +81,15 @@ bun run start
 
 Set `AUTO_ENTRY=true` for the actual paper strategy.
 
+Paper is deliberately harsher than live:
+
+- Paper entries clear the same live-router quote + 3% deviation gate as live buys (read-only, never broadcast). Unroutable entries are skipped, not filled at fantasy marks. With an unfunded wallet, 0x reports `insufficient taker balance`; the probe records `0x-balance-limited` and passes (route exists, deviation unknown) with a warning instead of skipping.
+- Every paper sell probes the live router read-only and records route + mark deviation into `quote_checks`. Fills still print at mark; the probe is diagnostic.
+- Costs: configurable bps fees/slippage per side plus a fixed `PAPER_GAS_PER_FILL_USD` per fill and a `PAPER_EXIT_HAIRCUT_PCT` haircut on every sell (confirmation lag, retry slippage, taxes), all booked into cash, realized PnL, and fee/slippage totals.
+- Every Telegram message carries a `💰 Balance: before → after` leg.
+
+A 5-minute WAL checkpoint keeps external DuckDB copies fresh. Unit tests pin the research regime (`bun run test` sets the band + zero friction); raw `bun test` follows the operator `.env` instead.
+
 ## Live rollout
 
 Use a fresh pilot wallet. Start with the configured $10 position size and maximum 3 positions. First verify the tiny ETH↔WETH smoke test, then run the strategy with small capital while comparing:
@@ -107,7 +117,7 @@ All JSON writes use temporary files followed by rename. The bot lock also uses a
 
 ```bash
 bun run check
-bun test
+bun run test
 bun run smoke
 ```
 
