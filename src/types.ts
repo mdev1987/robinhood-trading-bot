@@ -77,6 +77,8 @@ export interface Position {
   totalEntryFeeUsd: number;
   totalExitFeeUsd: number;
   totalSlippageUsd: number;
+  /** Gas component of fees, tracked separately so ledgers can decompose costs. */
+  totalGasUsd: number;
   shadowFeeUsd: number;
   shadowSlipUsd: number;
 

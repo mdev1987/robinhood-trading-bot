@@ -200,6 +200,7 @@ export function openPosition(args: {
     totalEntryFeeUsd: entryFee,
     totalExitFeeUsd: 0,
     totalSlippageUsd: quantity * Math.abs(fillPrice - args.marketPrice),
+    totalGasUsd: 0,
     // Shadow entry cost modeled on the full notional (research only).
     shadowFeeUsd: args.usdSize * (SHADOW_FEE_BPS / 10_000),
     shadowSlipUsd: args.usdSize * (SHADOW_SLIPPAGE_BPS / 10_000),

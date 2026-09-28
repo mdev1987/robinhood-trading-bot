@@ -53,4 +53,13 @@ describe("rollingExpectancyNegative", () => {
     const ten = Array.from({ length: 10 }, (_, i) => loss(`t${i}`, now));
     expect(rollingExpectancyNegative(ten, "robinhood", 50)).toBe(true);
   });
+
+  test("stale losses expire so the gate cannot deadlock shut", () => {
+    const now = Date.now();
+    const old = (id: string) => ({ ...loss(id, now), closedAt: now - 25 * 3_600_000 });
+    const stale = Array.from({ length: 10 }, (_, i) => old(`t${i}`));
+    expect(rollingExpectancyNegative(stale, "robinhood", 50, now, 24 * 60)).toBe(false);
+    const fresh = Array.from({ length: 10 }, (_, i) => loss(`t${i}`, now));
+    expect(rollingExpectancyNegative(fresh, "robinhood", 50, now, 24 * 60)).toBe(true);
+  });
 });

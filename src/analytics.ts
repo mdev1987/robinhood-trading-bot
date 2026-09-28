@@ -57,6 +57,8 @@ export interface FillRecord {
   notionalUsd: number | null;
   feeUsd: number | null;
   slipUsd: number | null;
+  /** Gas component of this fill (subset of feeUsd when modeled jointly). */
+  gasUsd: number | null;
   detail: string;
   /** Cash after the fill. Always cash — never equity (see equityAfterUsd). */
   balanceAfterUsd: number;
@@ -90,6 +92,8 @@ export interface TradeRecord {
   tpLevels: string;
   feesUsd: number | null;
   slipUsd: number | null;
+  /** Gas subtotal (subset of feesUsd when modeled jointly). */
+  gasUsd: number | null;
   balanceBeforeUsd: number | null;
   balanceAfterUsd: number | null;
   entryLiquidityUsd: number | null;
@@ -136,7 +140,7 @@ const FILLS_DDL = `CREATE TABLE IF NOT EXISTS fills (
   symbol VARCHAR, token_name VARCHAR, pair VARCHAR, pool VARCHAR, ca VARCHAR,
   quote VARCHAR, price DOUBLE, qty DOUBLE, notional_usd DOUBLE, fee_usd DOUBLE,
   slip_usd DOUBLE, detail VARCHAR, balance_after_usd DOUBLE,
-  equity_after_usd DOUBLE
+  equity_after_usd DOUBLE, gas_usd DOUBLE
 )`;
 
 // Per-minute market snapshots of open positions. Exists for one research
@@ -171,7 +175,8 @@ const TRADES_DDL = `CREATE TABLE IF NOT EXISTS trades (
   net_pnl_usd DOUBLE, cost_model VARCHAR, mfe_pct DOUBLE, mae_pct DOUBLE,
   exit_pct DOUBLE, giveback_pp DOUBLE, time_to_mfe_s BIGINT,
   time_to_mae_s BIGINT, exit_trigger_pct DOUBLE, gap_through_stop BOOLEAN,
-  modeled_fee_usd DOUBLE, modeled_slip_usd DOUBLE, drained_exit BOOLEAN
+  modeled_fee_usd DOUBLE, modeled_slip_usd DOUBLE, drained_exit BOOLEAN,
+  gas_usd DOUBLE
 )`;
 
 // Columns added after the initial schema. Applied idempotently on every
@@ -203,6 +208,7 @@ const TRADES_MIGRATION_COLUMNS = [
   "modeled_fee_usd DOUBLE",
   "modeled_slip_usd DOUBLE",
   "drained_exit BOOLEAN",
+  "gas_usd DOUBLE",
 ];
 
 /**
@@ -249,6 +255,10 @@ async function openConnection(dbPath: string): Promise<DuckDBConnection> {
   }
   // fills.equity_after_usd did not exist before: old rows keep NULL.
   await connection.run(`ALTER TABLE fills ADD COLUMN IF NOT EXISTS equity_after_usd DOUBLE`);
+  // fills.gas_usd splits gas out of fee_usd for cost decomposition.
+  await connection.run(`ALTER TABLE fills ADD COLUMN IF NOT EXISTS gas_usd DOUBLE`);
+  // trades.gas_usd likewise.
+  await connection.run(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS gas_usd DOUBLE`);
   // Idempotent backfill: exits whose quote diagnostic reported a drained
   // pool predate the drained_exit column.
   try {
@@ -333,19 +343,19 @@ export async function recordFill(fill: FillRecord): Promise<void> {
   const c = await ensure();
   if (!c) return;
   try {
-    // Explicit column list: migrated ledgers append equity_after_usd at
-    // the end, so positional INSERTs would misalign there.
+    // Explicit column list: migrated ledgers append equity_after_usd and
+    // gas_usd at the end, so positional INSERTs would misalign there.
     await c.run(
       `INSERT INTO fills (time, side, position_id, chain, dex, symbol,
         token_name, pair, pool, ca, quote, price, qty, notional_usd,
-        fee_usd, slip_usd, detail, balance_after_usd, equity_after_usd)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+        fee_usd, slip_usd, detail, balance_after_usd, equity_after_usd, gas_usd)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
       [
         fill.time, fill.side, fill.positionId, fill.chain, fill.dex,
         fill.symbol, fill.tokenName, fill.pair, fill.pool, fill.ca,
         fill.quote, num(fill.price), num(fill.qty), num(fill.notionalUsd),
         num(fill.feeUsd), num(fill.slipUsd), fill.detail,
-        num(fill.balanceAfterUsd), num(fill.equityAfterUsd),
+        num(fill.balanceAfterUsd), num(fill.equityAfterUsd), num(fill.gasUsd),
       ],
     );
   } catch (error) {
@@ -413,8 +423,8 @@ export async function recordTrade(trade: TradeRecord): Promise<void> {
         entry_liquidity_usd, exit_liquidity_usd, entry_age_s,
         net_pnl_usd, cost_model, mfe_pct, mae_pct, exit_pct, giveback_pp,
         time_to_mfe_s, time_to_mae_s, exit_trigger_pct, gap_through_stop,
-        modeled_fee_usd, modeled_slip_usd, drained_exit)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40)`,
+        modeled_fee_usd, modeled_slip_usd, drained_exit, gas_usd)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41)`,
       [
         trade.positionId, trade.chain, trade.dex, trade.symbol,
         trade.tokenName, trade.pair, trade.pool, trade.ca, trade.quote,
@@ -430,6 +440,7 @@ export async function recordTrade(trade: TradeRecord): Promise<void> {
         trade.timeToMfeS, trade.timeToMaeS, num(trade.exitTriggerPct),
         trade.gapThroughStop,
         num(trade.modeledFeeUsd), num(trade.modeledSlipUsd), trade.drainedExit,
+        num(trade.gasUsd),
       ],
     );
   } catch (error) {
@@ -535,6 +546,7 @@ export function tradeRecordFromPosition(
     tpLevels,
     feesUsd: position.totalEntryFeeUsd + position.totalExitFeeUsd,
     slipUsd: position.totalSlippageUsd,
+    gasUsd: position.totalGasUsd,
     balanceBeforeUsd: args.balanceBeforeUsd,
     balanceAfterUsd: args.balanceAfterUsd,
     entryLiquidityUsd: position.entryLiquidityUsd ?? null,

@@ -76,6 +76,7 @@ function applyPaperGas(p: Position, side: "ENTRY" | "EXIT", amountUsd = config.e
   if (!(gas > 0)) return;
   portfolio.spend(gas);
   p.realizedPnlUsd -= gas;
+  p.totalGasUsd += gas;
   if (side === "ENTRY") p.totalEntryFeeUsd += gas;
   else p.totalExitFeeUsd += gas;
 }
@@ -134,6 +135,9 @@ function sameSymbolOpen(symbol: string): boolean {
 
 function alreadyTradedPool(key: string): boolean { return portfolio.closedTrades.some((t) => t.id === key); }
 
+/** Expectancy looks back one day: stale losses expire instead of locking entries forever. */
+const EXPECTANCY_WINDOW_MIN = 24 * 60;
+
 function entryGates(): boolean {
   if (isEntryPausedAt(new Date(), config.entry.pausedHoursUtc)) {
     if (Date.now() - lastPausedLog > 3_600_000) { lastPausedLog = Date.now(); log("⏸️ entry hour paused (20–23 UTC)"); }
@@ -143,7 +147,7 @@ function entryGates(): boolean {
   if (paperLossLimitBreached(portfolio.closedTrades, config.risk.paperDailyLossLimitUsd, Date.now())) return false;
   const stops = recentStopCount(portfolio.closedTrades, CHAIN, Date.now(), config.risk.breakerWindowMin);
   if (stops >= config.risk.breakerStops) return false;
-  if (rollingExpectancyNegative(portfolio.closedTrades, CHAIN, config.risk.expectancyTrades)) return false;
+  if (rollingExpectancyNegative(portfolio.closedTrades, CHAIN, config.risk.expectancyTrades, Date.now(), EXPECTANCY_WINDOW_MIN)) return false;
   return openCount() < config.entry.maxOpenPositions;
 }
 
@@ -280,6 +284,7 @@ async function paperOpen(
       p.lowestPrice = p.entryPrice;
       p.realizedPnlUsd = -(bpsFee + quoteGas);
       p.totalEntryFeeUsd = bpsFee + quoteGas;
+      p.totalGasUsd = quoteGas;
       p.totalSlippageUsd = 0;
       positions.set(p.id, p);
       ledgerCosts.set(p.id, { fee: p.totalExitFeeUsd, slip: p.totalSlippageUsd });
@@ -292,7 +297,7 @@ async function paperOpen(
         time: Date.now(), side: "BUY", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol,
         tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress,
         quote: p.quoteSymbol, price: p.entryPrice, qty: p.quantity, notionalUsd: p.initialUsdSize,
-        feeUsd: p.totalEntryFeeUsd, slipUsd: p.totalSlippageUsd, detail: `paper:${exec.quote.source}:dev${exec.deviationPct.toFixed(2)}`,
+        feeUsd: p.totalEntryFeeUsd, slipUsd: p.totalSlippageUsd, gasUsd: quoteGas, detail: `paper:${exec.quote.source}:dev${exec.deviationPct.toFixed(2)}`,
         balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: portfolio.equityUsd(positions.values()),
       });
       await notify(buildBuyMessage(p, config.entry.maxOpenPositions, openCount(), p.balanceBeforeUsd, portfolio.cashUsd));
@@ -315,7 +320,7 @@ async function paperOpen(
       time: Date.now(), side: "BUY", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol,
       tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress,
       quote: p.quoteSymbol, price: p.entryPrice, qty: p.quantity, notionalUsd: p.initialUsdSize,
-      feeUsd: p.totalEntryFeeUsd, slipUsd: p.totalSlippageUsd, detail: "paper",
+      feeUsd: p.totalEntryFeeUsd, slipUsd: p.totalSlippageUsd, gasUsd: config.entry.gasPerFillUsd, detail: "paper",
       balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: portfolio.equityUsd(positions.values()),
     });
     await notify(buildBuyMessage(p, config.entry.maxOpenPositions, openCount(), p.balanceBeforeUsd, portfolio.cashUsd));
@@ -548,7 +553,7 @@ async function liveOpen(c: Candidate, pair: DexScreenerPair): Promise<void> {
     pair: result.position.pairAddress, pool: result.position.poolAddress ?? "", ca: result.position.tokenAddress,
     quote: result.position.quoteSymbol, price: result.position.entryPrice, qty: result.position.quantity,
     notionalUsd: result.position.initialUsdSize, feeUsd: result.position.totalEntryFeeUsd,
-    slipUsd: result.position.totalSlippageUsd, detail: `live:${result.quote.source}:${result.executionHash}`,
+    slipUsd: result.position.totalSlippageUsd, gasUsd: result.position.totalGasUsd, detail: `live:${result.quote.source}:${result.executionHash}`,
     balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: null,
   });
   await notify(buildBuyMessage(result.position, config.entry.maxOpenPositions, liveOpenCount(), cashBefore, liveCashUsd()));
@@ -623,7 +628,7 @@ async function paperTick(p: Position, pair: DexScreenerPair): Promise<void> {
       const feeDelta = p.totalExitFeeUsd - prev.fee;
       const slipDelta = p.totalSlippageUsd - prev.slip;
       ledgerCosts.set(p.id, { fee: p.totalExitFeeUsd, slip: p.totalSlippageUsd });
-      await recordFill({ time: now, side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol, tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress, quote: p.quoteSymbol, price: exitPrice, qty: e.soldQty, notionalUsd: proceeds, feeUsd: feeDelta, slipUsd: slipDelta, detail: `TP${e.level}${exec.status === "quoted" ? ":quoted" : ""}`, balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: portfolio.equityUsd(positions.values()) });
+      await recordFill({ time: now, side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol, tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress, quote: p.quoteSymbol, price: exitPrice, qty: e.soldQty, notionalUsd: proceeds, feeUsd: feeDelta, slipUsd: slipDelta, gasUsd: gas, detail: `TP${e.level}${exec.status === "quoted" ? ":quoted" : ""}`, balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: portfolio.equityUsd(positions.values()) });
       await notify(buildTpMessage(p, e.level, e.gainPct, e.soldQty, proceeds, e.realizedPnlUsd + (proceeds - e.proceedsUsd) - gas, e.remainingPct, cashBefore, portfolio.cashUsd));
     }
     if (e.type === "TRAIL_ACTIVATED") await notify(buildUpdateMessage("TRAIL", p, e.trailStop, portfolio.cashUsd));
@@ -654,7 +659,7 @@ async function paperTick(p: Position, pair: DexScreenerPair): Promise<void> {
       positions.delete(p.id); lastSnapshotAt.delete(p.id);
       const prev = ledgerCosts.get(p.id) ?? { fee: p.totalEntryFeeUsd, slip: 0 };
       ledgerCosts.delete(p.id);
-      await recordFill({ time: now, side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol, tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress, quote: p.quoteSymbol, price: exitPrice, qty: e.soldQty, notionalUsd: proceeds, feeUsd: p.totalExitFeeUsd - prev.fee, slipUsd: p.totalSlippageUsd - prev.slip, detail: `${e.type}${quoted ? ":quoted" : ""}`, balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: p.balanceAfterUsd ?? portfolio.cashUsd });
+      await recordFill({ time: now, side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol, tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress, quote: p.quoteSymbol, price: exitPrice, qty: e.soldQty, notionalUsd: proceeds, feeUsd: p.totalExitFeeUsd - prev.fee, slipUsd: p.totalSlippageUsd - prev.slip, gasUsd: gas, detail: `${e.type}${quoted ? ":quoted" : ""}`, balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: p.balanceAfterUsd ?? portfolio.cashUsd });
       await recordTrade(tradeRecordFromPosition(p, { pnlUsd: p.realizedPnlUsd, pnlPct: p.initialUsdSize > 0 ? p.realizedPnlUsd / p.initialUsdSize * 100 : 0, balanceBeforeUsd: p.balanceBeforeUsd ?? NaN, balanceAfterUsd: p.balanceAfterUsd ?? NaN }));
       await notify(buildCloseMessage(p, portfolio.snapshot(positions.values()), portfolio.chainStat(CHAIN), portfolio.tokenPnlUsd(CHAIN, p.symbol)));
       persist(true); break;
@@ -698,7 +703,7 @@ async function applyLiveSellFill(
     tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress,
     quote: p.quoteSymbol, price: sell.exitPriceUsd,
     qty: before - p.quantity, notionalUsd: Number.isFinite(proceedsUsd) ? proceedsUsd : Math.max(0, sell.exitPriceUsd * (before - p.quantity)),
-    feeUsd: sell.gasUsd, slipUsd: 0, detail: `live:${_kind}${_level ? `:TP${_level}` : ""}:${sell.result.hash}`,
+    feeUsd: sell.gasUsd, slipUsd: 0, gasUsd: sell.gasUsd, detail: `live:${_kind}${_level ? `:TP${_level}` : ""}:${sell.result.hash}`,
     balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: null,
   });
   persist(true);

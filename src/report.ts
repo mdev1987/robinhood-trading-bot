@@ -89,7 +89,7 @@ export function buildCloseMessage(p: Position, snap: PortfolioSnapshot, chainSta
     `💧 Liquidity: ${usd(p.entryLiquidityUsd ?? NaN)} → ${usd(p.exitLiquidityUsd ?? NaN)}`,
     `🔝 High: ${price(p.highestPrice)}  |  🎯 ${p.tpHit.map((h,i)=>h?`TP${i+1}✅`:`TP${i+1}❌`).join(" ")}`,
     `📈 PnL: ${signedUsd(pnl)} (${pct(totalPnlPct(p))})`,
-    `💸 Fees: ${usd(p.totalEntryFeeUsd + p.totalExitFeeUsd)} | Exec shortfall: ${usd(p.totalSlippageUsd)}`,
+    `💸 Fees (ex-gas): ${usd(p.totalEntryFeeUsd + p.totalExitFeeUsd - p.totalGasUsd)} | Gas: ${usd(p.totalGasUsd)} | Exec shortfall: ${usd(p.totalSlippageUsd)}`,
     `🧾 ${SHADOW_COST_MODEL}: ${signedUsd(pnl - p.shadowFeeUsd - p.shadowSlipUsd)}`,
     `📦 Size: ${usd(p.initialUsdSize)} | ⏳ ${duration((p.closedAt ?? Date.now()) - p.openedAt)}`,
     balanceLine(p.balanceBeforeUsd, snap.cashUsd),

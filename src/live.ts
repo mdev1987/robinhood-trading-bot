@@ -138,6 +138,7 @@ function makeStrategyFromLive(p: LivePosition): Position {
   position.totalEntryFeeUsd = p.entryGasUsd ?? 0;
   position.totalExitFeeUsd = 0;
   position.totalSlippageUsd = 0;
+  position.totalGasUsd = p.entryGasUsd ?? 0;
   applyStrategyState(position, strategy);
   return position;
 }
@@ -256,7 +257,7 @@ async function reconcileConfirmedBuy(order: LiveOrder, log: (msg: string) => voi
     const gasUsd = fill.gasUsd ?? 0;
     if (!(qty > 0) || !(costUsd > 0)) throw new Error("invalid recovered BUY economics");
     const p = openPosition({ id: order.positionId, chain: RH.chain, pairAddress: order.pairAddress, tokenAddress: order.tokenAddress, symbol: order.tokenSymbol, tokenName: order.tokenName, quoteSymbol: order.quoteSymbol ?? "ETH", dexId: order.dexId, ...(order.pairUrl ? { pairUrl: order.pairUrl } : {}), marketPrice: costUsd / qty, usdSize: costUsd, entryLiquidityUsd: order.entryLiquidityUsd ?? 0, entryAgeSec: order.entryAgeSec ?? 0, exitProfile: order.exitProfile ?? robinhoodExitProfile(), now: order.createdAt });
-    p.quantity = qty; p.originalQuantity = qty; p.initialUsdSize = costUsd; p.entryPrice = costUsd / qty; p.currentPrice = p.entryPrice; p.realizedPnlUsd = -gasUsd; p.totalEntryFeeUsd = gasUsd; p.totalSlippageUsd = 0; p.totalExitFeeUsd = 0;
+    p.quantity = qty; p.originalQuantity = qty; p.initialUsdSize = costUsd; p.entryPrice = costUsd / qty; p.currentPrice = p.entryPrice; p.realizedPnlUsd = -gasUsd; p.totalEntryFeeUsd = gasUsd; p.totalSlippageUsd = 0; p.totalExitFeeUsd = 0; p.totalGasUsd = gasUsd;
     const strategy = captureStrategyState(p);
     livePositions.set(order.positionId, {
       positionId: order.positionId, pairAddress: order.pairAddress, tokenAddress: order.tokenAddress, tokenSymbol: order.tokenSymbol, tokenName: order.tokenName, dexId: order.dexId, ...(order.pairUrl ? { pairUrl: order.pairUrl } : {}), quoteSymbol: "ETH", tokenDecimals: decimals, quoteToken: NATIVE, quoteDecimals: 18,
@@ -412,7 +413,7 @@ export async function liveBuy(candidate: Candidate, pair: DexScreenerPair, sizeU
   if (!(qty > 0) || !(costUsd > 0)) throw new Error("RH BUY fill cannot be valued");
   const gasUsd = gasUsdFromExecution(result, ethUsd);
   const p = openPosition({ id: candidate.key, chain: RH.chain, pairAddress: candidate.pairAddress, tokenAddress: candidate.tokenAddress, symbol: candidate.tokenSymbol, tokenName: candidate.tokenName, quoteSymbol: "ETH", dexId: pair.dexId, ...(pair.url ? { pairUrl: pair.url } : {}), marketPrice: costUsd / qty, usdSize: costUsd, poolAddress: candidate.poolAddress, entryLiquidityUsd: Number(pair.liquidity?.usd ?? 0), entryAgeSec: Math.max(0, (Date.now() - candidate.poolCreatedAt) / 1000), exitProfile: robinhoodExitProfile() });
-  p.entryPrice = costUsd / qty; p.currentPrice = p.entryPrice; p.highestPrice = p.entryPrice; p.lowestPrice = p.entryPrice; p.totalEntryFeeUsd = gasUsd; p.totalExitFeeUsd = 0; p.totalSlippageUsd = 0; p.realizedPnlUsd = -gasUsd;
+  p.entryPrice = costUsd / qty; p.currentPrice = p.entryPrice; p.highestPrice = p.entryPrice; p.lowestPrice = p.entryPrice; p.totalEntryFeeUsd = gasUsd; p.totalExitFeeUsd = 0; p.totalSlippageUsd = 0; p.totalGasUsd = gasUsd; p.realizedPnlUsd = -gasUsd;
   const lp: LivePosition = { positionId: p.id, pairAddress: p.pairAddress, tokenAddress: p.tokenAddress, tokenSymbol: p.symbol, tokenName: p.tokenName, dexId: p.dexId, ...(p.pairUrl ? { pairUrl: p.pairUrl } : {}), quoteSymbol: "ETH", tokenDecimals: decimals, quoteToken: NATIVE, quoteDecimals: 18, originalQtyRaw: result.buyAmount, remainingQtyRaw: result.buyAmount, entryCostQuoteRaw: result.sellAmount, entryCostUsd: costUsd, entryPriceUsd: p.entryPrice, entryLiquidityUsd: p.entryLiquidityUsd ?? 0, entryAgeSec: p.entryAgeSec ?? 0, entryGasUsd: gasUsd, realizedPnlUsd: 0, openedAt: p.openedAt, updatedAt: Date.now(), strategy: captureStrategyState(p) };
   livePositions.set(p.id, lp);
   const buyCashBefore = portfolioCashUsd;
