@@ -35,3 +35,11 @@ test("venue quote accepts canonical WETH and native zero address only", () => {
   expect(isEthVenueQuote("")).toBe(false);
   expect(isEthVenueQuote(null)).toBe(false);
 });
+
+test("paper live-shadow simulation knobs load with sane bounds", () => {
+  expect(config.paperExecution.submitDelayMs).toBeGreaterThanOrEqual(0);
+  expect(config.paperExecution.confirmDelayMs).toBeGreaterThanOrEqual(0);
+  expect(config.paperExecution.latencyPercentile).toBeGreaterThanOrEqual(0);
+  expect(config.paperExecution.latencyPercentile).toBeLessThanOrEqual(100);
+  expect(config.paperExecution.quoteTimeoutMs).toBeGreaterThan(0);
+});

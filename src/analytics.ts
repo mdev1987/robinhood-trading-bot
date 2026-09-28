@@ -18,6 +18,14 @@ export interface QuoteCheckRecord {
   buyDecimals: number | null;
   riskPass: boolean | null;
   simOk: boolean | null;
+  quoteLatencyMs?: number | null;
+  simulatedLatencyMs?: number | null;
+  gasUsd?: number | null;
+  quoteFeeUsd?: number | null;
+  executionPriceUsd?: number | null;
+  executionNotionalUsd?: number | null;
+  executionOk?: boolean | null;
+  executionReason?: string | null;
   note: string;
 }
 
@@ -147,7 +155,9 @@ const QUOTE_CHECKS_DDL = `CREATE TABLE IF NOT EXISTS quote_checks (
   source VARCHAR, paper_price_usd DOUBLE,
   quoted_sell_amount VARCHAR, quoted_buy_amount VARCHAR,
   sell_decimals INTEGER, buy_decimals INTEGER,
-  risk_pass BOOLEAN, sim_ok BOOLEAN, note VARCHAR
+  risk_pass BOOLEAN, sim_ok BOOLEAN, note VARCHAR,
+  quote_latency_ms DOUBLE, simulated_latency_ms DOUBLE, gas_usd DOUBLE, quote_fee_usd DOUBLE,
+  execution_price_usd DOUBLE, execution_notional_usd DOUBLE, execution_ok BOOLEAN, execution_reason VARCHAR
 )`;
 
 const TRADES_DDL = `CREATE TABLE IF NOT EXISTS trades (
@@ -168,6 +178,17 @@ const TRADES_DDL = `CREATE TABLE IF NOT EXISTS trades (
 // open so pre-existing ledgers gain them (appended at the end) without a
 // manual migration step. recordTrade uses an explicit column list, so the
 // differing column order between fresh and migrated DBs is harmless.
+const QUOTE_CHECKS_MIGRATION_COLUMNS = [
+  "quote_latency_ms DOUBLE",
+  "simulated_latency_ms DOUBLE",
+  "gas_usd DOUBLE",
+  "quote_fee_usd DOUBLE",
+  "execution_price_usd DOUBLE",
+  "execution_notional_usd DOUBLE",
+  "execution_ok BOOLEAN",
+  "execution_reason VARCHAR",
+];
+
 const TRADES_MIGRATION_COLUMNS = [
   "net_pnl_usd DOUBLE",
   "cost_model VARCHAR",
@@ -218,6 +239,10 @@ async function openConnection(dbPath: string): Promise<DuckDBConnection> {
   await connection.run(TRADES_DDL);
   await connection.run(SNAPSHOTS_DDL);
   await connection.run(QUOTE_CHECKS_DDL);
+  for (const column of QUOTE_CHECKS_MIGRATION_COLUMNS) {
+    const name = column.split(" ")[0]!;
+    await connection.run(`ALTER TABLE quote_checks ADD COLUMN IF NOT EXISTS ${name} ${column.slice(name.length + 1)}`);
+  }
   for (const column of TRADES_MIGRATION_COLUMNS) {
     const name = column.split(" ")[0]!;
     await connection.run(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS ${name} ${column.slice(name.length + 1)}`);
@@ -355,12 +380,15 @@ export async function recordQuoteCheck(check: QuoteCheckRecord): Promise<void> {
   if (!c) return;
   try {
     await c.run(
-      `INSERT INTO quote_checks VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      `INSERT INTO quote_checks (time, position_id, chain, side, source, paper_price_usd, quoted_sell_amount, quoted_buy_amount, sell_decimals, buy_decimals, risk_pass, sim_ok, note, quote_latency_ms, simulated_latency_ms, gas_usd, quote_fee_usd, execution_price_usd, execution_notional_usd, execution_ok, execution_reason)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
       [
         check.time, check.positionId, check.chain, check.side, check.source,
         num(check.paperPriceUsd), check.quotedSellAmount, check.quotedBuyAmount,
         check.sellDecimals, check.buyDecimals, check.riskPass, check.simOk,
-        check.note,
+        check.note, num(check.quoteLatencyMs ?? null), num(check.simulatedLatencyMs ?? null),
+        num(check.gasUsd ?? null), num(check.quoteFeeUsd ?? null), num(check.executionPriceUsd ?? null),
+        num(check.executionNotionalUsd ?? null), check.executionOk ?? null, check.executionReason ?? null,
       ],
     );
   } catch (error) {

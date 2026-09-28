@@ -99,6 +99,8 @@ export interface Position {
   entryLiquidityUsd?: number;
   entryAgeSec?: number;
   exitLiquidityUsd?: number;
+  /** Actual simulated/live final fill price used for close reporting. */
+  finalExitPriceUsd?: number;
 }
 
 export interface PriceSnapshot {
@@ -122,6 +124,12 @@ export interface Quote {
   buyTaxBps?: number | null;
   sellTaxBps?: number | null;
   estimatedGasUnits?: number | null;
+  zeroExFeeAmount?: string;
+  zeroExFeeToken?: string;
+  zeroExFeeType?: string;
+  gasPriceWei?: string;
+  /** Router-measured quote latency, set by getBestExecutableQuote. */
+  quoteLatencyMs?: number;
   to: string;
   calldata: string;
   value: string;
@@ -150,6 +158,7 @@ export interface ExecutionResult {
   buyAmount: string;
   gasUsed?: string;
   effectiveGasPrice?: string;
+  executionLatencyMs?: number;
 }
 
 export interface SimulationResult {

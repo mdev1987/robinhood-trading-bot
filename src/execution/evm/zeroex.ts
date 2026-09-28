@@ -12,11 +12,13 @@ interface ZeroExResponse {
   buyAmount?: string;
   minBuyAmount?: string;
   gas?: string | number;
+  gasPrice?: string | number;
   tokenMetadata?: {
     buyToken?: { buyTaxBps?: string | number; sellTaxBps?: string | number };
     sellToken?: { buyTaxBps?: string | number; sellTaxBps?: string | number };
   };
-  transaction?: { to?: string; data?: string; gas?: string | number; value?: string };
+  transaction?: { to?: string; data?: string; gas?: string | number; gasPrice?: string | number; value?: string };
+  fees?: { zeroExFee?: { amount?: string; token?: string; type?: string } };
   allowanceTarget?: string;
   issues?: { allowance?: { spender?: string } | null; balance?: unknown; simulationIncomplete?: boolean };
 }
@@ -46,6 +48,10 @@ export function mapZeroExQuote(request: QuoteRequest, raw: ZeroExResponse): Quot
     buyTaxBps: raw.tokenMetadata?.buyToken?.buyTaxBps == null ? null : Number(raw.tokenMetadata.buyToken.buyTaxBps),
     sellTaxBps: raw.tokenMetadata?.sellToken?.sellTaxBps == null ? null : Number(raw.tokenMetadata.sellToken.sellTaxBps),
     estimatedGasUnits: tx.gas != null ? Number(tx.gas) : raw.gas != null ? Number(raw.gas) : null,
+    ...(raw.fees?.zeroExFee?.amount ? { zeroExFeeAmount: raw.fees.zeroExFee.amount } : {}),
+    ...(raw.fees?.zeroExFee?.token ? { zeroExFeeToken: raw.fees.zeroExFee.token } : {}),
+    ...(raw.fees?.zeroExFee?.type ? { zeroExFeeType: raw.fees.zeroExFee.type } : {}),
+    ...(tx.gasPrice != null ? { gasPriceWei: String(tx.gasPrice) } : raw.gasPrice != null ? { gasPriceWei: String(raw.gasPrice) } : {}),
     to: tx.to,
     calldata: tx.data,
     value: tx.value ?? (request.sellToken.toLowerCase() === EEEE.toLowerCase() ? sellAmount : "0"),

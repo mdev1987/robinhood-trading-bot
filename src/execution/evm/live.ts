@@ -4,6 +4,7 @@ import { RH, config } from "../../config.ts";
 import { getEvmPublicClient, getEvmWalletClient, traderAddress, withTxLock, waitReceipt } from "./viem-client.ts";
 import { simulateEvmCall } from "./simulator.ts";
 import { assessQuoteRisk, LIVE_BUY_POLICY, LIVE_SELL_POLICY } from "../risk.ts";
+import { recordLiveLatency } from "../latency.ts";
 
 const ERC20 = parseAbi([
   "function allowance(address owner,address spender) view returns (uint256)",
@@ -126,13 +127,19 @@ export async function executeQuote(quote: Quote, label: string, onSubmitted?: (h
     if (!sim.ok) throw new Error(`${label}: eth_call simulation failed: ${sim.reason}`);
 
     const wallet = getEvmWalletClient();
+    const submitStarted = Date.now();
     const hash = await wallet.sendTransaction({ to: quote.to as Address, data: quote.calldata as `0x${string}`, value, account: trader, chain: wallet.chain });
+    const submitMs = Date.now() - submitStarted;
+    recordLiveLatency("submit", submitMs);
     try {
       await onSubmitted?.(hash);
     } catch (error) {
       throw new Error(`broadcast ${hash} but submission journal failed: ${String(error).slice(0, 200)}`);
     }
+    const confirmStarted = Date.now();
     const receipt = await waitReceipt(hash);
+    const confirmMs = Date.now() - confirmStarted;
+    recordLiveLatency("confirm", confirmMs);
     if (receipt.status !== "success") throw new Error(`${label}: transaction reverted ${hash}`);
 
     const amounts = extractExecutionAmounts(receipt.logs as never, trader, quote.sellToken, quote.buyToken, quote.sellAmount);
@@ -145,6 +152,7 @@ export async function executeQuote(quote: Quote, label: string, onSubmitted?: (h
       buyAmount: amounts.buyAmount,
       gasUsed: gasUsed.toString(),
       effectiveGasPrice: effectiveGasPrice.toString(),
+      executionLatencyMs: submitMs + confirmMs,
     };
   });
 }

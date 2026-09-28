@@ -134,6 +134,16 @@ export const config = {
     maxRpm: num("DEXSCREENER_MAX_RPM", 290),
     batchSize: num("DEXSCREENER_PAIR_BATCH_SIZE", 20),
   },
+  paperExecution: {
+    // Live-shadow simulation: quote, wait submit+confirm delays, re-quote,
+    // then fill from the fresh executable quote (min-output checked).
+    // Learned live latencies override the fixed delays once samples exist.
+    submitDelayMs: num("PAPER_SUBMIT_DELAY_MS", 150),
+    confirmDelayMs: num("PAPER_CONFIRM_DELAY_MS", 600),
+    latencyPercentile: num("PAPER_LATENCY_PERCENTILE", 50),
+    quoteTimeoutMs: num("PAPER_QUOTE_TIMEOUT_MS", 15_000),
+    latencyFile: env("PAPER_LATENCY_FILE", "data/execution-latency.json"),
+  },
   entry: {
     auto: bool("AUTO_ENTRY", false),
     positionSizeUsd: num("POSITION_SIZE_USD", 10),
@@ -209,6 +219,7 @@ export const config = {
     rpcFallbackUrl: process.env.ROBINHOOD_RPC_FALLBACK_URL ?? "",
     zeroExKey: process.env.ZEROEX_API_KEY ?? "",
     orderRetentionDays: num("LIVE_ORDER_RETENTION_DAYS", 30),
+    latencyFile: env("LIVE_LATENCY_FILE", "data/execution-latency.json"),
   },
   telegram: {
     enabled: bool("TELEGRAM_ENABLED", false),
@@ -240,6 +251,9 @@ if (config.entry.positionSizeUsd <= 0 || config.entry.positionSizeUsd > config.p
 if (config.entry.confirmDelayMs <= 0 || config.entry.confirmMaxPriceDropPct <= 0 || config.entry.confirmMaxLiqDropPct <= 0) throw new Error("Invalid confirmation config");
 if (!(config.entry.gasPerFillUsd >= 0)) throw new Error("PAPER_GAS_PER_FILL_USD must be >= 0");
 if (!(config.entry.exitHaircutPct >= 0) || config.entry.exitHaircutPct > 100) throw new Error("PAPER_EXIT_HAIRCUT_PCT must be 0..100");
+if (config.paperExecution.submitDelayMs < 0 || config.paperExecution.confirmDelayMs < 0) throw new Error("Paper execution delays must be >= 0");
+if (config.paperExecution.latencyPercentile < 0 || config.paperExecution.latencyPercentile > 100) throw new Error("PAPER_LATENCY_PERCENTILE must be 0..100");
+if (config.paperExecution.quoteTimeoutMs <= 0) throw new Error("PAPER_QUOTE_TIMEOUT_MS must be positive");
 if (config.stops.initialPct <= config.earlyStop.stopPct || config.earlyStop.stopPct <= 0) throw new Error("Early stop must be positive and tighter than initial stop");
 if (config.stops.trailActivationPct <= 0 || config.stops.trailDistancePct <= 0) throw new Error("Invalid trailing stop config");
 if (config.risk.maxDailyLiveLossUsd <= 0) throw new Error("MAX_DAILY_LIVE_LOSS_USD must be positive");

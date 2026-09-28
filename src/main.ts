@@ -22,6 +22,7 @@ import {
 } from "./live.ts";
 import { getEvmPublicClient, traderAddress } from "./execution/evm/viem-client.ts";
 import { getBestExecutableQuote, makeQuoteRequest } from "./execution/router.ts";
+import { paperLatency } from "./execution/latency.ts";
 import { runLiveSmokeTest } from "./live-test.ts";
 
 const CHAIN = RH.chain;
@@ -41,6 +42,7 @@ let shuttingDown = false;
 function log(msg: string): void { console.log(`${new Date().toISOString()} ${msg}`); }
 async function notify(msg: string): Promise<void> { try { await telegram(msg); } catch (e) { log(`⚠️ Telegram failed: ${String(e).slice(0, 180)}`); } }
 function ageSec(createdAt: number): number { return Math.max(0, (Date.now() - createdAt) / 1000); }
+function sleepMs(ms: number): Promise<void> { return ms > 0 ? new Promise<void>((resolve) => setTimeout(resolve, ms)) : Promise.resolve(); }
 function openCount(): number { return [...positions.values()].filter((p) => p.status === "OPEN").length; }
 
 function isRealizedSellEvent(e: PositionEvent): e is Extract<PositionEvent, { soldQty: number; proceedsUsd: number }> {
@@ -315,7 +317,7 @@ async function paperOpen(
 }
 
 async function probeBuyQuote(c: Candidate, pair: DexScreenerPair, price: number, sizeUsd: number): Promise<
-  | { ok: true; quoted: true; quote: Quote; decimals: number; ethUsd: number; deviationPct: number }
+  | { ok: true; quoted: true; quote: Quote; decimals: number; ethUsd: number; deviationPct: number; quoteLatencyMs: number; simulatedLatencyMs: number }
   | { ok: true; quoted: false; balanceLimited: true }
   | { ok: false; reason: string }
 > {
@@ -342,17 +344,39 @@ async function probeBuyQuote(c: Candidate, pair: DexScreenerPair, price: number,
     if (sellRaw <= 0n) { await recordQuoteCheck({ ...base, source: "skipped", note: "dust-size" }); return { ok: false, reason: "dust-size" }; }
     let taker: string;
     try { taker = traderAddress(); } catch { await recordQuoteCheck({ ...base, source: "skipped", note: "no-trader-key" }); return { ok: false, reason: "no-trader-key" }; }
+    const quoteTimeout = config.paperExecution.quoteTimeoutMs;
+    const quoteStarted = Date.now();
     const quote = await Promise.race([
       getBestExecutableQuote(makeQuoteRequest({ sellToken: NATIVE, buyToken: c.tokenAddress, sellAmountBaseUnits: sellRaw.toString(), slippageBps: config.live.buySlippageBps, pairAddress: pair.pairAddress, taker }), "BUY"),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe timeout")), 20_000)),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe timeout")), quoteTimeout)),
     ]);
+    const quoteLatencyMs = quote.quoteLatencyMs ?? (Date.now() - quoteStarted);
     const decimals = await probeTokenDecimals(c.tokenAddress);
-    const tokenQty = Number(BigInt(quote.buyAmount)) / 10 ** decimals;
+    // Simulated submit+confirm delay (learned live latencies once sampled,
+    // fixed fallbacks until then), then a fresh re-quote: the fill uses the
+    // post-delay executable quote, and a fresh output below the initial
+    // minBuyAmount is a simulated live revert, not a fill.
+    const submitDelay = paperLatency("submit", config.paperExecution.submitDelayMs);
+    const confirmDelay = paperLatency("confirm", config.paperExecution.confirmDelayMs);
+    await sleepMs(submitDelay + confirmDelay);
+    const requoteStarted = Date.now();
+    const fresh = await Promise.race([
+      getBestExecutableQuote(makeQuoteRequest({ sellToken: NATIVE, buyToken: c.tokenAddress, sellAmountBaseUnits: sellRaw.toString(), slippageBps: config.live.buySlippageBps, pairAddress: pair.pairAddress, taker }), "BUY"),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe requote timeout")), quoteTimeout)),
+    ]);
+    const requoteLatencyMs = fresh.quoteLatencyMs ?? (Date.now() - requoteStarted);
+    const simulatedLatencyMs = quoteLatencyMs + submitDelay + confirmDelay + requoteLatencyMs;
+    const minBuy = BigInt(quote.minBuyAmount ?? quote.buyAmount);
+    if (BigInt(fresh.buyAmount) < minBuy) {
+      await recordQuoteCheck({ ...base, source: fresh.source, quotedSellAmount: fresh.sellAmount, quotedBuyAmount: fresh.buyAmount, buyDecimals: decimals, executionOk: false, executionReason: "min-output-failed", note: `requoted below initial minBuyAmount after ${simulatedLatencyMs}ms simulated latency` });
+      return { ok: false, reason: "simulated min-output revert" };
+    }
+    const tokenQty = Number(BigInt(fresh.buyAmount)) / 10 ** decimals;
     const quotedValueUsd = tokenQty * Number(pair.priceUsd);
     const deviation = Math.abs(quotedValueUsd / sizeUsd - 1) * 100;
-    await recordQuoteCheck({ ...base, source: quote.source, quotedSellAmount: quote.sellAmount, quotedBuyAmount: quote.buyAmount, buyDecimals: decimals, note: `quotable latencyMs=${Date.now() - started}; impact=${quote.priceImpactPct ?? "unknown"}; deviation=${Number.isFinite(deviation) ? deviation.toFixed(2) : "?"}%` });
+    await recordQuoteCheck({ ...base, source: fresh.source, quotedSellAmount: fresh.sellAmount, quotedBuyAmount: fresh.buyAmount, buyDecimals: decimals, quoteLatencyMs, simulatedLatencyMs, executionOk: true, executionReason: "live-shadow", note: `quotable quoteLatencyMs=${quoteLatencyMs} simulatedLatencyMs=${simulatedLatencyMs}; impact=${fresh.priceImpactPct ?? "unknown"}; deviation=${Number.isFinite(deviation) ? deviation.toFixed(2) : "?"}%` });
     if (!Number.isFinite(deviation) || deviation > config.safety.quoteDeviationPct) return { ok: false, reason: `deviates ${Number.isFinite(deviation) ? deviation.toFixed(2) : "?"}%` };
-    return { ok: true, quoted: true, quote, decimals, ethUsd, deviationPct: deviation };
+    return { ok: true, quoted: true, quote: fresh, decimals, ethUsd, deviationPct: deviation, quoteLatencyMs, simulatedLatencyMs };
   } catch (error) {
     const msg = String(error);
     if (/insufficient taker balance/i.test(msg)) {
@@ -412,7 +436,7 @@ async function probeTokenDecimals(tokenAddress: string): Promise<number> {
  * Never broadcasts. Falls back to mark fills only when unquotable.
  */
 type SellExec =
-  | { status: "quoted"; quote: Quote; proceedsUsd: number; gasUsd: number; deviationPct: number; attempts: number }
+  | { status: "quoted"; quote: Quote; proceedsUsd: number; gasUsd: number; deviationPct: number; attempts: number; quoteLatencyMs: number; simulatedLatencyMs: number }
   | { status: "balance-limited" }
   | { status: "unavailable"; reason: string };
 
@@ -443,25 +467,47 @@ async function quoteSellExec(p: Position, pair: DexScreenerPair, soldQtyUnits: n
     for (let i = 0; i < steps.length; i++) {
       const slip = steps[i]!;
       try {
+        const quoteStarted = Date.now();
         const quote = await Promise.race([
           getBestExecutableQuote(makeQuoteRequest({ sellToken: p.tokenAddress, buyToken: NATIVE, sellAmountBaseUnits: sellRaw.toString(), slippageBps: slip, pairAddress: pair.pairAddress, taker }), "SELL"),
-          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe timeout")), 12_000)),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe timeout")), config.paperExecution.quoteTimeoutMs)),
         ]);
-        const outEth = Number(BigInt(quote.buyAmount)) / 1e18;
+        const quoteLatencyMs = quote.quoteLatencyMs ?? (Date.now() - quoteStarted);
+        // Simulated submit+confirm delay, then a fresh re-quote: the fill
+        // uses the post-delay executable output, and fresh output below the
+        // initial minBuyAmount is a simulated live revert, not a fill.
+        const submitDelay = paperLatency("submit", config.paperExecution.submitDelayMs);
+        const confirmDelay = paperLatency("confirm", config.paperExecution.confirmDelayMs);
+        await sleepMs(submitDelay + confirmDelay);
+        const requoteStarted = Date.now();
+        const fresh = await Promise.race([
+          getBestExecutableQuote(makeQuoteRequest({ sellToken: p.tokenAddress, buyToken: NATIVE, sellAmountBaseUnits: sellRaw.toString(), slippageBps: slip, pairAddress: pair.pairAddress, taker }), "SELL"),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe requote timeout")), config.paperExecution.quoteTimeoutMs)),
+        ]);
+        const requoteLatencyMs = fresh.quoteLatencyMs ?? (Date.now() - requoteStarted);
+        const simulatedLatencyMs = quoteLatencyMs + submitDelay + confirmDelay + requoteLatencyMs;
+        const minBuy = BigInt(quote.minBuyAmount ?? quote.buyAmount);
+        if (BigInt(fresh.buyAmount) < minBuy) {
+          lastError = "simulated min-output revert";
+          await recordQuoteCheck({ ...base, source: fresh.source, quotedSellAmount: fresh.sellAmount, quotedBuyAmount: fresh.buyAmount, sellDecimals: decimals, quoteLatencyMs, simulatedLatencyMs, executionOk: false, executionReason: "min-output-failed", note: `${label}@${slip} requoted below initial minBuyAmount after ${simulatedLatencyMs}ms simulated latency` });
+          continue;
+        }
+        const outEth = Number(BigInt(fresh.buyAmount)) / 1e18;
         const quotedUsd = outEth * ethUsd;
         const expectedUsd = soldQtyUnits * markPrice;
         const deviation = expectedUsd > 0 ? Math.abs(quotedUsd / expectedUsd - 1) * 100 : NaN;
         await recordQuoteCheck({
-          ...base, source: quote.source, quotedSellAmount: quote.sellAmount, quotedBuyAmount: quote.buyAmount,
-          sellDecimals: decimals, note: `${label}@${slip} quotable attempt=${i + 1} latencyMs=${Date.now() - started}; impact=${quote.priceImpactPct ?? "unknown"}; deviation=${Number.isFinite(deviation) ? deviation.toFixed(2) : "?"}%`,
+          ...base, source: fresh.source, quotedSellAmount: fresh.sellAmount, quotedBuyAmount: fresh.buyAmount,
+          sellDecimals: decimals, quoteLatencyMs, simulatedLatencyMs, executionOk: true, executionReason: "live-shadow",
+          note: `${label}@${slip} quotable attempt=${i + 1} quoteLatencyMs=${quoteLatencyMs} simulatedLatencyMs=${simulatedLatencyMs}; impact=${fresh.priceImpactPct ?? "unknown"}; deviation=${Number.isFinite(deviation) ? deviation.toFixed(2) : "?"}%`,
         });
         if (!Number.isFinite(deviation) || deviation > config.safety.quoteDeviationPct) {
           lastError = `deviates ${Number.isFinite(deviation) ? deviation.toFixed(2) : "?"}%`;
           log(`⚠️ SELL quote deviates ${p.symbol} ${label}@${slip}: ${lastError}`);
           continue;
         }
-        const gas = await paperExecGasUsd(quote, ethUsd);
-        return { status: "quoted", quote, proceedsUsd: quotedUsd, gasUsd: gas, deviationPct: deviation, attempts: i + 1 };
+        const gas = await paperExecGasUsd(fresh, ethUsd);
+        return { status: "quoted", quote: fresh, proceedsUsd: quotedUsd, gasUsd: gas, deviationPct: deviation, attempts: i + 1, quoteLatencyMs, simulatedLatencyMs };
       } catch (error) {
         const msg = String(error);
         if (/insufficient taker balance/i.test(msg)) {

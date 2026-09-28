@@ -10,7 +10,9 @@ export async function getBestExecutableQuote(request: QuoteRequest, side: "BUY" 
   const errors: string[] = [];
   const attempt = async (name: string, fn: () => Promise<Quote>) => {
     try {
+      const started = Date.now();
       const q = await fn();
+      q.quoteLatencyMs = Date.now() - started;
       const risk = assessQuoteRisk(q, policy);
       if (!risk.pass) throw new Error(risk.reasons.join(","));
       candidates.push(q);
