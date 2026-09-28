@@ -53,7 +53,8 @@ export function recentStopCount(
 
 /**
  * True when the last `lookback` closed trades on the chain net below zero.
- * Needs at least 5 trades — no data, no gate.
+ * Needs at least 10 trades — with fewer, any dip is noise and the gate
+ * would latch on every fresh sample (observed: 5-trade -$2.44 lockout).
  */
 export function rollingExpectancyNegative(
   closed: readonly ClosedTrade[],
@@ -61,7 +62,7 @@ export function rollingExpectancyNegative(
   lookback: number,
 ): boolean {
   const mine = closed.filter((t) => t.chain === chain);
-  if (mine.length < Math.min(5, lookback)) return false;
+  if (mine.length < Math.min(10, lookback)) return false;
   const window = mine.slice(-lookback);
   return window.reduce((sum, t) => sum + t.pnlUsd, 0) < 0;
 }

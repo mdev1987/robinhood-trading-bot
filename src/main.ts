@@ -36,6 +36,7 @@ const pendingConfirms = new Map<string, { candidate: Candidate; firstPrice: numb
 const exitCash = new Map<string, { before: number; after: number }>();
 let lastPersist = 0;
 let lastPausedLog = 0;
+let lastGatedLog = 0;
 let lastCheckpointAt = 0;
 let shuttingDown = false;
 
@@ -169,7 +170,16 @@ function makeCandidate(pool: Awaited<ReturnType<typeof fetchNewestPools>>[number
 }
 
 async function queueCandidate(candidate: Candidate): Promise<void> {
-  if (!entryGates()) return;
+  if (!entryGates()) {
+    // Throttled: gates can stay shut for hours (full book, breaker,
+    // expectancy) while discovery keeps finding pools — log the blockage
+    // instead of dropping candidates silently every 40s.
+    if (Date.now() - lastGatedLog > 600_000) {
+      lastGatedLog = Date.now();
+      log(`⏸️ entries gated (book ${openCount()}/${config.entry.maxOpenPositions}, breaker/expectancy guards?) — candidates waiting`);
+    }
+    return;
+  }
   if (seenPools.has(candidate.key) || (config.entry.oneEntryPerPool && alreadyTradedPool(candidate.key))) return;
   if (sameSymbolOpen(candidate.tokenSymbol)) return;
   if (config.safety.blockRepeatSymbols && isRepeatSymbol(

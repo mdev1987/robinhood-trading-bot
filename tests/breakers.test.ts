@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { isRepeatSymbol, recentStopCount } from "../src/breakers.ts";
+import { isRepeatSymbol, recentStopCount, rollingExpectancyNegative } from "../src/breakers.ts";
 
 describe("isRepeatSymbol", () => {
   test("flags open and closed same-chain symbols, case-insensitively", () => {
@@ -41,5 +41,16 @@ describe("recentStopCount", () => {
       { id: "c", chain: "robinhood", symbol: "C", dexId: "d", pnlUsd: -1, pnlPct: -10, reason: "DRAIN_EXIT", durationMs: 1, openedAt: now - 1000, closedAt: now - 40 * 60_000 },
     ];
     expect(recentStopCount(closed, "robinhood", now, 30)).toBe(1);
+  });
+});
+
+describe("rollingExpectancyNegative", () => {
+  const loss = (id: string, now: number) => ({ id, chain: "robinhood", symbol: id, dexId: "d", pnlUsd: -1, pnlPct: -10, reason: "STOP_EXIT", durationMs: 1, openedAt: now - 1000, closedAt: now - 60_000 });
+  test("needs at least 10 trades before gating on noise", () => {
+    const now = Date.now();
+    const five = Array.from({ length: 5 }, (_, i) => loss(`t${i}`, now));
+    expect(rollingExpectancyNegative(five, "robinhood", 50)).toBe(false);
+    const ten = Array.from({ length: 10 }, (_, i) => loss(`t${i}`, now));
+    expect(rollingExpectancyNegative(ten, "robinhood", 50)).toBe(true);
   });
 });
