@@ -1,6 +1,6 @@
 import { config, isEntryPausedAt, isEthVenueQuote, isPoolEntryBandValid, NATIVE, RH, robinhoodExitProfile } from "./config.ts";
 import { fetchNewestPools } from "./dexpaprika.ts";
-import { assessConfirmation, getPair, getPairsByChain, parsePrice, pairLiquidityUsd } from "./dexscreener.ts";
+import { assessConfirmation, buyRatio5m, getPair, getPairsByChain, isStaleLiquidity, parsePrice, pairLiquidityUsd, priceChange5m } from "./dexscreener.ts";
 import { openPosition, updatePosition } from "./position.ts";
 import { Portfolio } from "./portfolio.ts";
 import { loadState, saveState } from "./store.ts";
@@ -583,6 +583,23 @@ async function fireConfirms(): Promise<void> {
     // that the startup/reporting config advertises.
     if (!isPoolEntryBandValid(item.candidate.poolCreatedAt, secondLiquidity)) {
       log(`⏭️ skip entry ${item.candidate.tokenSymbol}: final band check failed (age=${ageSec(item.candidate.poolCreatedAt).toFixed(1)}s liq=$${secondLiquidity ?? "unknown"})`);
+      continue;
+    }
+
+    // Anti-scam quality gates on the confirmation print (absent venue data
+    // skips the check; only reported values can veto).
+    if (config.entry.stalenessReject && isStaleLiquidity(item.firstLiquidity, secondLiquidity)) {
+      log(`⏭️ skip entry ${item.candidate.tokenSymbol}: stale venue liquidity ($${secondLiquidity})`);
+      continue;
+    }
+    const buyRatio = buyRatio5m(pair);
+    if (config.entry.minBuyRatio5m > 0 && buyRatio !== null && buyRatio < config.entry.minBuyRatio5m) {
+      log(`⏭️ skip entry ${item.candidate.tokenSymbol}: sell-dominated 5m flow (buy ratio ${(buyRatio * 100).toFixed(1)}%)`);
+      continue;
+    }
+    const pump = priceChange5m(pair);
+    if (config.entry.maxPumpPct5m > 0 && pump !== null && pump > config.entry.maxPumpPct5m) {
+      log(`⏭️ skip entry ${item.candidate.tokenSymbol}: already pumped +${pump.toFixed(1)}% in 5m`);
       continue;
     }
 

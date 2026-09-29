@@ -6,7 +6,7 @@
   "scripts": {
     "start": "bun run src/main.ts",
     "check": "bunx tsc --noEmit",
-    "test": "NEW_POOL_MIN_AGE_SEC=60 NEW_POOL_MAX_AGE_SEC=120 PAPER_ENTRY_FEE_BPS=0 PAPER_EXIT_FEE_BPS=0 PAPER_SLIPPAGE_BPS=0 PAPER_GAS_PER_FILL_USD=0 PAPER_EXIT_HAIRCUT_PCT=0 bun test tests/",
+    "test": "NEW_POOL_MIN_AGE_SEC=60 NEW_POOL_MAX_AGE_SEC=120 PAPER_ENTRY_FEE_BPS=0 PAPER_EXIT_FEE_BPS=0 PAPER_SLIPPAGE_BPS=0 PAPER_GAS_PER_FILL_USD=0 PAPER_EXIT_HAIRCUT_PCT=0 ENTRY_MIN_BUY_RATIO_5M=0.4 ENTRY_MAX_PUMP_PCT_5M=50 bun test tests/",
     "smoke": "node --experimental-strip-types tests/smoke.mjs"
   },
   "dependencies": {

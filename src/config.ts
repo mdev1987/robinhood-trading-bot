@@ -165,6 +165,13 @@ export const config = {
     confirmDelayMs: num("ENTRY_CONFIRM_DELAY_MS", 3_000),
     confirmMaxPriceDropPct: num("ENTRY_CONFIRM_MAX_PRICE_DROP_PCT", 5),
     confirmMaxLiqDropPct: num("ENTRY_CONFIRM_MAX_LIQ_DROP_PCT", 30),
+    // Anti-scam quality gates, checked on the confirmation print.
+    // Stale venue liquidity (byte-identical across confirmation) printed
+    // 5/5 flat losers: reject it. Buy-dominance and pump caps read the 5m
+    // txn mix; absent venue data skips the check rather than vetoing.
+    stalenessReject: bool("ENTRY_STALENESS_REJECT", true),
+    minBuyRatio5m: num("ENTRY_MIN_BUY_RATIO_5M", 0.4),
+    maxPumpPct5m: num("ENTRY_MAX_PUMP_PCT_5M", 50),
     pausedHoursUtc: parseHourSet(process.env.ENTRY_PAUSED_HOURS_UTC ?? "20,21,22,23"),
   },
   portfolio: { initialBalanceUsd: num("INITIAL_BALANCE_USD", 10_000) },
@@ -249,6 +256,8 @@ if (!Number.isInteger(config.entry.maxOpenPositions) || config.entry.maxOpenPosi
 if (!Number.isInteger(config.entry.maxSameSymbolOpen) || config.entry.maxSameSymbolOpen !== 1) throw new Error("MAX_SAME_SYMBOL_OPEN must be exactly 1 for the Robinhood strategy");
 if (config.entry.positionSizeUsd <= 0 || config.entry.positionSizeUsd > config.portfolio.initialBalanceUsd) throw new Error("POSITION_SIZE_USD invalid");
 if (config.entry.confirmDelayMs <= 0 || config.entry.confirmMaxPriceDropPct <= 0 || config.entry.confirmMaxLiqDropPct <= 0) throw new Error("Invalid confirmation config");
+if (config.entry.minBuyRatio5m < 0 || config.entry.minBuyRatio5m > 1) throw new Error("ENTRY_MIN_BUY_RATIO_5M must be 0..1 (0 disables)");
+if (config.entry.maxPumpPct5m < 0) throw new Error("ENTRY_MAX_PUMP_PCT_5M must be >= 0 (0 disables)");
 if (!(config.entry.gasPerFillUsd >= 0)) throw new Error("PAPER_GAS_PER_FILL_USD must be >= 0");
 if (!(config.entry.exitHaircutPct >= 0) || config.entry.exitHaircutPct > 100) throw new Error("PAPER_EXIT_HAIRCUT_PCT must be 0..100");
 if (config.paperExecution.submitDelayMs < 0 || config.paperExecution.confirmDelayMs < 0) throw new Error("Paper execution delays must be >= 0");

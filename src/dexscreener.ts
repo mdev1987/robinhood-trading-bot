@@ -104,3 +104,26 @@ export function pairLiquidityUsd(pair: DexScreenerPair): number | null {
   const value = Number(raw);
   return Number.isFinite(value) && value >= 0 ? value : null;
 }
+
+/**
+ * True when the venue reports byte-identical liquidity on two prints.
+ * Observed 5/5 as flat losers: an unchanged print across confirmation
+ * means a dead pool or stale venue reporting, not a live market.
+ */
+export function isStaleLiquidity(firstUsd: number | null, secondUsd: number | null): boolean {
+  return firstUsd !== null && secondUsd !== null && firstUsd > 0 && secondUsd === firstUsd;
+}
+
+/** Share of 5m transactions that are buys (null when unreported). */
+export function buyRatio5m(pair: DexScreenerPair): number | null {
+  const buys = Number(pair.txns?.m5?.buys);
+  const sells = Number(pair.txns?.m5?.sells);
+  if (!Number.isFinite(buys) || !Number.isFinite(sells) || buys < 0 || sells < 0 || buys + sells <= 0) return null;
+  return buys / (buys + sells);
+}
+
+/** 5m price change in percent (null when unreported). Positive = pumped. */
+export function priceChange5m(pair: DexScreenerPair): number | null {
+  const value = Number(pair.priceChange?.m5);
+  return Number.isFinite(value) ? value : null;
+}
