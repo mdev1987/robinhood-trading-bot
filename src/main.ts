@@ -792,11 +792,14 @@ async function executePaperSell(item: PendingPaperSell): Promise<void> {
   const qty = Math.min(item.qtyUnits, p.quantity);
   if (!(qty > 0)) { dequeuePaperSell(item.positionId, item.label); return; }
   const exec = await quoteSellExec(p, pair, qty, item.label, mark).catch((err): SellExec => ({ status: "unavailable", reason: String(err).slice(0, 120) }));
-  if (exec.status !== "quoted") {
+  if (exec.status === "balance-limited") {
+    // Known empty wallet, not a market failure: retrying cannot change the
+    // outcome, so fall straight through to the mark fill (logged once at probe).
+  } else if (exec.status !== "quoted") {
     if (item.attempts < config.live.sellMaxRetries) {
       item.attempts += 1;
       item.nextAttemptAt = Date.now() + sellRetryDelayMs(item.attempts);
-      log(`⚠️ paper ${item.label} ${p.symbol} attempt ${item.attempts} unquotable (${exec.status === "balance-limited" ? "balance-limited" : exec.reason}); retrying`);
+      log(`⚠️ paper ${item.label} ${p.symbol} attempt ${item.attempts} unquotable (${exec.reason}); retrying`);
       return;
     }
     log(`⚠️ paper ${item.label} ${p.symbol} unquotable after ${item.attempts} retries: mark fill with pessimism stack`);
