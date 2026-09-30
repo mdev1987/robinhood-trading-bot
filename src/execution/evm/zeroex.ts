@@ -59,7 +59,7 @@ export function mapZeroExQuote(request: QuoteRequest, raw: ZeroExResponse): Quot
   };
 }
 
-export async function quote0x(request: QuoteRequest): Promise<Quote> {
+export async function quote0x(request: QuoteRequest, signal?: AbortSignal): Promise<Quote> {
   if (!config.live.zeroExKey) throw new Error("ZEROEX_API_KEY is not configured");
   const url = new URL(BASE);
   url.searchParams.set("chainId", String(RH.chainId));
@@ -68,11 +68,25 @@ export async function quote0x(request: QuoteRequest): Promise<Quote> {
   url.searchParams.set("sellAmount", request.sellAmountBaseUnits);
   url.searchParams.set("taker", request.taker);
   url.searchParams.set("slippageBps", String(request.slippageBps));
-  const response = await fetch(url, {
-    headers: { accept: "application/json", "0x-api-key": config.live.zeroExKey, "0x-version": "v2" },
-    signal: AbortSignal.timeout(12_000),
-  });
-  const body = await response.text();
-  if (!response.ok) throw new Error(`0x HTTP ${response.status}: ${body.slice(0, 300)}`);
-  return mapZeroExQuote(request, JSON.parse(body) as ZeroExResponse);
+  // Link the caller's abort (paper timeouts) with our own bound so a timed
+  // out quote actually cancels the underlying request instead of lingering.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error("0x timeout")), 12_000);
+  const onAbort = (): void => ctrl.abort(signal?.reason ?? new Error("quote aborted"));
+  if (signal) {
+    if (signal.aborted) ctrl.abort(signal.reason);
+    else signal.addEventListener("abort", onAbort, { once: true });
+  }
+  try {
+    const response = await fetch(url, {
+      headers: { accept: "application/json", "0x-api-key": config.live.zeroExKey, "0x-version": "v2" },
+      signal: ctrl.signal,
+    });
+    const body = await response.text();
+    if (!response.ok) throw new Error(`0x HTTP ${response.status}: ${body.slice(0, 300)}`);
+    return mapZeroExQuote(request, JSON.parse(body) as ZeroExResponse);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+  }
 }

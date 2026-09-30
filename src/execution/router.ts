@@ -4,7 +4,7 @@ import { quote0x } from "./evm/zeroex.ts";
 import { quoteUniswapV2 } from "./evm/uniswap-v2.ts";
 import { traderAddress } from "./evm/viem-client.ts";
 
-export async function getBestExecutableQuote(request: QuoteRequest, side: "BUY" | "SELL"): Promise<Quote> {
+export async function getBestExecutableQuote(request: QuoteRequest, side: "BUY" | "SELL", signal?: AbortSignal): Promise<Quote> {
   const policy = side === "BUY" ? LIVE_BUY_POLICY : LIVE_SELL_POLICY;
   const candidates: Quote[] = [];
   const errors: string[] = [];
@@ -21,7 +21,7 @@ export async function getBestExecutableQuote(request: QuoteRequest, side: "BUY" 
   // Direct V2 is checked first because the signal is a specific fresh Uniswap pool.
   // 0x remains the preferred aggregator for routes not executable directly.
   if (request.pairAddress) await attempt("uniswap-v2", () => quoteUniswapV2(request));
-  await attempt("0x", () => quote0x(request));
+  await attempt("0x", () => quote0x(request, signal));
   candidates.sort((a, b) => {
     const out = BigInt(b.buyAmount) - BigInt(a.buyAmount);
     if (out !== 0n) return out > 0n ? 1 : -1;

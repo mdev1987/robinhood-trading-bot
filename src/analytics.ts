@@ -94,6 +94,12 @@ export interface TradeRecord {
   slipUsd: number | null;
   /** Gas subtotal (subset of feesUsd when modeled jointly). */
   gasUsd: number | null;
+  /**
+   * Fill provenance: 'quoted' (every fill from an executable quote),
+   * 'mixed', 'mark' (mark fallback), or 'live' (on-chain execution).
+   * Prevents mixing unquoted paper history with quoted results in analysis.
+   */
+  fillModel: string | null;
   balanceBeforeUsd: number | null;
   balanceAfterUsd: number | null;
   entryLiquidityUsd: number | null;
@@ -176,7 +182,7 @@ const TRADES_DDL = `CREATE TABLE IF NOT EXISTS trades (
   exit_pct DOUBLE, giveback_pp DOUBLE, time_to_mfe_s BIGINT,
   time_to_mae_s BIGINT, exit_trigger_pct DOUBLE, gap_through_stop BOOLEAN,
   modeled_fee_usd DOUBLE, modeled_slip_usd DOUBLE, drained_exit BOOLEAN,
-  gas_usd DOUBLE
+  gas_usd DOUBLE, fill_model VARCHAR
 )`;
 
 // Columns added after the initial schema. Applied idempotently on every
@@ -209,6 +215,7 @@ const TRADES_MIGRATION_COLUMNS = [
   "modeled_slip_usd DOUBLE",
   "drained_exit BOOLEAN",
   "gas_usd DOUBLE",
+  "fill_model VARCHAR",
 ];
 
 /**
@@ -423,8 +430,8 @@ export async function recordTrade(trade: TradeRecord): Promise<void> {
         entry_liquidity_usd, exit_liquidity_usd, entry_age_s,
         net_pnl_usd, cost_model, mfe_pct, mae_pct, exit_pct, giveback_pp,
         time_to_mfe_s, time_to_mae_s, exit_trigger_pct, gap_through_stop,
-        modeled_fee_usd, modeled_slip_usd, drained_exit, gas_usd)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41)`,
+        modeled_fee_usd, modeled_slip_usd, drained_exit, gas_usd, fill_model)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42)`,
       [
         trade.positionId, trade.chain, trade.dex, trade.symbol,
         trade.tokenName, trade.pair, trade.pool, trade.ca, trade.quote,
@@ -440,7 +447,7 @@ export async function recordTrade(trade: TradeRecord): Promise<void> {
         trade.timeToMfeS, trade.timeToMaeS, num(trade.exitTriggerPct),
         trade.gapThroughStop,
         num(trade.modeledFeeUsd), num(trade.modeledSlipUsd), trade.drainedExit,
-        num(trade.gasUsd),
+        num(trade.gasUsd), trade.fillModel,
       ],
     );
   } catch (error) {
@@ -508,6 +515,7 @@ export function tradeRecordFromPosition(
     pnlPct: number;
     balanceBeforeUsd: number;
     balanceAfterUsd: number;
+    fillModel?: string | null;
   },
 ): TradeRecord {
   const tpLevels = position.tpHit
@@ -568,5 +576,6 @@ export function tradeRecordFromPosition(
     // Default at insert; the post-exit quote diagnostic flips it via
     // markTradeDrained when the pool turns out drained.
     drainedExit: false,
+    fillModel: args.fillModel ?? null,
   };
 }

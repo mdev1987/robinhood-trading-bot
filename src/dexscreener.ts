@@ -8,15 +8,32 @@ interface PairResponse {
 
 const limiter = new SlidingWindowRateLimiter(config.dexScreener.maxRpm);
 
+// Adaptive 429 handling: after a rate-limit response, all callers cool down
+// (honoring Retry-After when present, exponential backoff otherwise) instead
+// of hammering the endpoint every poll until the quote expires.
+let cooldownUntilMs = 0;
+let consec429 = 0;
+
 async function getJson<T>(url: URL): Promise<T> {
   await limiter.acquire();
+  const waitMs = cooldownUntilMs - Date.now();
+  if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs + 50));
   // Bounded: a hung DexScreener socket must never stall the price tracker
   // or the confirm worker past one poll interval.
   const response = await fetch(url, {
     headers: { accept: "application/json" },
     signal: AbortSignal.timeout(15_000),
   });
-  if (response.status === 429) throw new Error("DexScreener HTTP 429 rate limit");
+  if (response.status === 429) {
+    consec429 += 1;
+    const retryAfterSec = Number(response.headers.get("retry-after"));
+    const delayMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0
+      ? retryAfterSec * 1000
+      : Math.min(300_000, 30_000 * 2 ** Math.min(consec429 - 1, 3));
+    cooldownUntilMs = Date.now() + delayMs;
+    throw new Error(`DexScreener HTTP 429 rate limit (cooldown ${Math.round(delayMs / 1000)}s)`);
+  }
+  consec429 = 0;
   if (!response.ok) throw new Error(`DexScreener HTTP ${response.status}`);
   return await response.json() as T;
 }

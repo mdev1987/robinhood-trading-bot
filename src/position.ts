@@ -99,7 +99,8 @@ export function effectiveStopPrice(position: Position): number {
   return initialStopPrice(position);
 }
 
-function sellQuantity(
+/** Paper/live execution primitive: fill `quantity` units at `marketPrice`, mutating PnL/fees/slippage/quantity. Exported for the paper execution worker. */
+export function sellQuantity(
   position: Position,
   quantity: number,
   marketPrice: number,
@@ -133,8 +134,9 @@ function closePosition(position: Position, marketPrice: number, reason: Position
  * Close a remainder that cannot be sold at any price (venue liquidity at
  * dust). Banked TP proceeds stay in realizedPnlUsd; the leftover quantity
  * is written to zero with zero proceeds instead of a fantasy fill.
+ * Exported for the paper execution worker.
  */
-function closeWorthless(position: Position, reason: Position["closedReason"], now: number): { soldQty: number; proceedsUsd: number } {
+export function closeWorthless(position: Position, reason: Position["closedReason"], now: number): { soldQty: number; proceedsUsd: number } {
   position.quantity = 0;
   position.status = "CLOSED";
   if (reason !== undefined) position.closedReason = reason;

@@ -192,6 +192,22 @@ function orderForSell(positionId: string, label: string): LiveOrder | undefined 
 }
 function orderByTx(hash: string): LiveOrder | undefined { return orders.find((o) => o.txHash?.toLowerCase() === hash.toLowerCase()); }
 function looksUnknown(error: unknown): boolean { return /(timeout|timed out|network|socket|503|502|429|broadcast)/i.test(String(error)); }
+/** Deterministic on-chain revert (receipt received, status reverted). */
+export function isRevertError(error: unknown): boolean { return /revert/i.test(String(error)); }
+/**
+ * Classify a post-submit failure: a KNOWN revert marks the order FAILED so
+ * retries build a fresh order instead of bouncing off "already pending".
+ * Unknown/network failures keep the fail-closed UNKNOWN path.
+ */
+function classifySubmitFailure(orderId: string, error: unknown): void {
+  const current = findOrder(orderId);
+  if (current?.status === "SIGNAL") {
+    if (looksUnknown(error)) { current.status = "UNKNOWN"; current.note = String(error).slice(0, 500); halted = true; persist(); }
+    else updateOrder(orderId, { status: "FAILED", note: String(error).slice(0, 500) });
+  } else if (current && (current.status === "SUBMITTED" || current.status === "CONFIRMED") && isRevertError(error)) {
+    updateOrder(orderId, { status: "FAILED", note: `transaction reverted: ${String(error).slice(0, 400)}` });
+  } else if (looksUnknown(error)) { halted = true; persist(); }
+}
 function ethUsdFromPair(pair: DexScreenerPair): number | null {
   const usd = Number(pair.priceUsd), native = Number(pair.priceNative);
   if (!(usd > 0) || !(native > 0)) return null;
@@ -400,11 +416,7 @@ export async function liveBuy(candidate: Candidate, pair: DexScreenerPair, sizeU
   try {
     result = await executeQuote(quote, "RH BUY", (hash) => { updateOrder(order.id, { status: "SUBMITTED", txHash: hash }); });
   } catch (error) {
-    const current = findOrder(order.id);
-    if (current?.status === "SIGNAL") {
-      if (looksUnknown(error)) { current.status = "UNKNOWN"; current.note = String(error).slice(0, 500); halted = true; persist(); }
-      else updateOrder(order.id, { status: "FAILED", note: String(error).slice(0, 500) });
-    } else if (looksUnknown(error)) { halted = true; persist(); }
+    classifySubmitFailure(order.id, error);
     throw error;
   }
   const qty = Number(BigInt(result.buyAmount)) / 10 ** decimals;
@@ -446,10 +458,7 @@ export async function liveSell(position: Position, pair: DexScreenerPair, sellRa
   try {
     result = await executeQuote(quote, `RH SELL${level ? ` TP${level}` : ""}`, (hash) => { updateOrder(order.id, { status: "SUBMITTED", txHash: hash }); });
   } catch (error) {
-    const current = findOrder(order.id);
-    if (current?.status === "SIGNAL" && looksUnknown(error)) { current.status = "UNKNOWN"; current.note = String(error).slice(0, 500); halted = true; persist(); }
-    else if (current?.status === "SIGNAL") updateOrder(order.id, { status: "FAILED", note: String(error).slice(0, 500) });
-    else if (looksUnknown(error)) { halted = true; persist(); }
+    classifySubmitFailure(order.id, error);
     throw error;
   }
   const soldUnits = Number(BigInt(result.sellAmount)) / 10 ** lp.tokenDecimals;

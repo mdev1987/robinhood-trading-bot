@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { enqueueLiveSell, nextSellSlippageBps, sellRetryDelayMs } from "../src/live.ts";
+import { enqueueLiveSell, isRevertError, nextSellSlippageBps, sellRetryDelayMs } from "../src/live.ts";
 import type { PendingLiveSell } from "../src/live.ts";
 
 function item(overrides: Partial<PendingLiveSell> = {}): Omit<PendingLiveSell, "attempts" | "nextAttemptAt"> {
@@ -26,6 +26,15 @@ describe("sellRetryDelayMs", () => {
   test("backs off linearly", () => {
     expect(sellRetryDelayMs(0)).toBe(5000);
     expect(sellRetryDelayMs(2)).toBe(15000);
+  });
+});
+
+describe("isRevertError", () => {
+  test("distinguishes deterministic reverts from unknown failures", () => {
+    expect(isRevertError(new Error("RH SELL: transaction reverted 0xabc"))).toBe(true);
+    expect(isRevertError("execution reverted: overflow")).toBe(true);
+    expect(isRevertError(new Error("probe timeout"))).toBe(false);
+    expect(isRevertError(new Error("DexScreener HTTP 429 rate limit"))).toBe(false);
   });
 });
 

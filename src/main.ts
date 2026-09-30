@@ -1,7 +1,7 @@
 import { config, isEntryPausedAt, isEthVenueQuote, isPoolEntryBandValid, NATIVE, RH, robinhoodExitProfile } from "./config.ts";
 import { fetchNewestPools } from "./dexpaprika.ts";
 import { assessConfirmation, buyRatio5m, getPair, getPairsByChain, isStaleLiquidity, parsePrice, pairLiquidityUsd, priceChange5m } from "./dexscreener.ts";
-import { openPosition, updatePosition } from "./position.ts";
+import { closeWorthless, openPosition, remainingPct, sellQuantity, updatePosition } from "./position.ts";
 import { Portfolio } from "./portfolio.ts";
 import { loadState, saveState } from "./store.ts";
 import {
@@ -10,7 +10,7 @@ import {
 } from "./analytics.ts";
 import { telegram, testTelegram } from "./telegram.ts";
 import { buildBuyMessage, buildCloseMessage, buildLiveClosedMessage, buildStartupMessage, buildTpMessage, buildUpdateMessage } from "./report.ts";
-import type { Candidate, DexScreenerPair, Position, Quote } from "./types.ts";
+import type { Candidate, DexScreenerPair, Position, Quote, QuoteRequest } from "./types.ts";
 import type { PositionEvent } from "./position.ts";
 import { recentStopCount, rollingExpectancyNegative, paperLossLimitBreached, isRepeatSymbol } from "./breakers.ts";
 import { claimInstanceLockForStateFile } from "./instance-lock.ts";
@@ -18,9 +18,10 @@ import {
   liveBuy, liveEntryAllowed, liveOpenCount, initLive, restoredStrategyPositions,
   pumpLiveSells, queueLiveSell, isLiveSellPending, catchUpLiveSells,
   syncLiveStrategyState, flushLiveState, getLivePosition, finalizeLivePosition,
-  liveCashUsd, latchHalt, applyConfirmedLiveSell, liveStatus,
+  liveCashUsd, latchHalt, applyConfirmedLiveSell, liveStatus, nextSellSlippageBps, sellRetryDelayMs,
 } from "./live.ts";
 import { getEvmPublicClient, traderAddress } from "./execution/evm/viem-client.ts";
+import { simulateEvmCall } from "./execution/evm/simulator.ts";
 import { getBestExecutableQuote, makeQuoteRequest } from "./execution/router.ts";
 import { paperLatency } from "./execution/latency.ts";
 import { runLiveSmokeTest } from "./live-test.ts";
@@ -361,10 +362,7 @@ async function probeBuyQuote(c: Candidate, pair: DexScreenerPair, price: number,
     try { taker = traderAddress(); } catch { await recordQuoteCheck({ ...base, source: "skipped", note: "no-trader-key" }); return { ok: false, reason: "no-trader-key" }; }
     const quoteTimeout = config.paperExecution.quoteTimeoutMs;
     const quoteStarted = Date.now();
-    const quote = await Promise.race([
-      getBestExecutableQuote(makeQuoteRequest({ sellToken: NATIVE, buyToken: c.tokenAddress, sellAmountBaseUnits: sellRaw.toString(), slippageBps: config.live.buySlippageBps, pairAddress: pair.pairAddress, taker }), "BUY"),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe timeout")), quoteTimeout)),
-    ]);
+    const quote = await routerQuote(makeQuoteRequest({ sellToken: NATIVE, buyToken: c.tokenAddress, sellAmountBaseUnits: sellRaw.toString(), slippageBps: config.live.buySlippageBps, pairAddress: pair.pairAddress, taker }), "BUY", quoteTimeout);
     const quoteLatencyMs = quote.quoteLatencyMs ?? (Date.now() - quoteStarted);
     const decimals = await probeTokenDecimals(c.tokenAddress);
     // Simulated submit+confirm delay (learned live latencies once sampled,
@@ -375,10 +373,7 @@ async function probeBuyQuote(c: Candidate, pair: DexScreenerPair, price: number,
     const confirmDelay = paperLatency("confirm", config.paperExecution.confirmDelayMs);
     await sleepMs(submitDelay + confirmDelay);
     const requoteStarted = Date.now();
-    const fresh = await Promise.race([
-      getBestExecutableQuote(makeQuoteRequest({ sellToken: NATIVE, buyToken: c.tokenAddress, sellAmountBaseUnits: sellRaw.toString(), slippageBps: config.live.buySlippageBps, pairAddress: pair.pairAddress, taker }), "BUY"),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe requote timeout")), quoteTimeout)),
-    ]);
+    const fresh = await routerQuote(makeQuoteRequest({ sellToken: NATIVE, buyToken: c.tokenAddress, sellAmountBaseUnits: sellRaw.toString(), slippageBps: config.live.buySlippageBps, pairAddress: pair.pairAddress, taker }), "BUY", quoteTimeout);
     const requoteLatencyMs = fresh.quoteLatencyMs ?? (Date.now() - requoteStarted);
     const simulatedLatencyMs = quoteLatencyMs + submitDelay + confirmDelay + requoteLatencyMs;
     const minBuy = BigInt(quote.minBuyAmount ?? quote.buyAmount);
@@ -386,11 +381,30 @@ async function probeBuyQuote(c: Candidate, pair: DexScreenerPair, price: number,
       await recordQuoteCheck({ ...base, source: fresh.source, quotedSellAmount: fresh.sellAmount, quotedBuyAmount: fresh.buyAmount, buyDecimals: decimals, executionOk: false, executionReason: "min-output-failed", note: `requoted below initial minBuyAmount after ${simulatedLatencyMs}ms simulated latency` });
       return { ok: false, reason: "simulated min-output revert" };
     }
+    // Same eth_call simulation live runs pre-submit (read-only): a revert
+    // here is what live would refuse to broadcast.
+    const sim = await simulateEvmCall({
+      from: taker as `0x${string}`, to: fresh.to as `0x${string}`,
+      data: fresh.calldata as `0x${string}`, value: BigInt(fresh.value || "0"),
+    });
+    if (!sim.ok) {
+      const need = BigInt(fresh.value || "0");
+      const bal = await walletEthBalanceWei();
+      if (need > 0n && (bal === null || bal < need)) {
+        await recordQuoteCheck({ ...base, source: "0x-balance-limited", simOk: false, note: `balance-limited: sim needs funding; route exists` });
+        return { ok: true, quoted: false, balanceLimited: true };
+      }
+      await recordQuoteCheck({ ...base, source: fresh.source, quotedSellAmount: fresh.sellAmount, quotedBuyAmount: fresh.buyAmount, buyDecimals: decimals, quoteLatencyMs, simulatedLatencyMs, simOk: false, executionOk: false, executionReason: "sim-revert", note: `eth_call simulation reverted: ${sim.reason?.slice(0, 140)}` });
+      return { ok: false, reason: "simulated execution revert" };
+    }
     const tokenQty = Number(BigInt(fresh.buyAmount)) / 10 ** decimals;
     const quotedValueUsd = tokenQty * Number(pair.priceUsd);
     const deviation = Math.abs(quotedValueUsd / sizeUsd - 1) * 100;
-    await recordQuoteCheck({ ...base, source: fresh.source, quotedSellAmount: fresh.sellAmount, quotedBuyAmount: fresh.buyAmount, buyDecimals: decimals, quoteLatencyMs, simulatedLatencyMs, executionOk: true, executionReason: "live-shadow", note: `quotable quoteLatencyMs=${quoteLatencyMs} simulatedLatencyMs=${simulatedLatencyMs}; impact=${fresh.priceImpactPct ?? "unknown"}; deviation=${Number.isFinite(deviation) ? deviation.toFixed(2) : "?"}%` });
-    if (!Number.isFinite(deviation) || deviation > config.safety.quoteDeviationPct) return { ok: false, reason: `deviates ${Number.isFinite(deviation) ? deviation.toFixed(2) : "?"}%` };
+    await recordQuoteCheck({ ...base, source: fresh.source, quotedSellAmount: fresh.sellAmount, quotedBuyAmount: fresh.buyAmount, buyDecimals: decimals, quoteLatencyMs, simulatedLatencyMs, riskPass: true, simOk: true, executionOk: true, executionReason: "live-shadow", quoteFeeUsd: quoteFeeValueUsd(fresh, pair, ethUsd, decimals), note: `quotable quoteLatencyMs=${quoteLatencyMs} simulatedLatencyMs=${simulatedLatencyMs}; impact=${fresh.priceImpactPct ?? "unknown"}; deviation=${Number.isFinite(deviation) ? deviation.toFixed(2) : "?"}%` });
+    if (!Number.isFinite(deviation) || deviation > config.safety.quoteDeviationPct) {
+      await recordQuoteCheck({ ...base, source: fresh.source, quotedSellAmount: fresh.sellAmount, quotedBuyAmount: fresh.buyAmount, buyDecimals: decimals, quoteLatencyMs, simulatedLatencyMs, riskPass: true, simOk: true, executionOk: false, executionReason: "deviation-reject", note: `deviates ${Number.isFinite(deviation) ? deviation.toFixed(2) : "?"}%` });
+      return { ok: false, reason: `deviates ${Number.isFinite(deviation) ? deviation.toFixed(2) : "?"}%` };
+    }
     return { ok: true, quoted: true, quote: fresh, decimals, ethUsd, deviationPct: deviation, quoteLatencyMs, simulatedLatencyMs };
   } catch (error) {
     const msg = String(error);
@@ -428,7 +442,49 @@ async function paperExecGasUsd(quote: Quote, ethUsd: number): Promise<number> {
   return est === null ? config.entry.gasPerFillUsd : Math.max(est, config.entry.gasPerFillUsd);
 }
 
+/** 0x integrator fee valued in USD (recorded, not subtracted: buyAmount may already reflect it). */
+function quoteFeeValueUsd(quote: Quote, pair: DexScreenerPair, ethUsd: number, buyDecimals: number): number | null {
+  if (!quote.zeroExFeeAmount || !quote.zeroExFeeToken) return null;
+  const tok = quote.zeroExFeeToken.toLowerCase();
+  let price: number | null = null;
+  let dec = 18;
+  if (/^0x0{40}$/i.test(tok) || tok === "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" || tok === RH.contracts.weth.toLowerCase()) price = ethUsd;
+  else if (tok === pair.baseToken.address.toLowerCase()) { price = Number(pair.priceUsd); dec = buyDecimals; }
+  if (!(price !== null && price > 0)) return null;
+  const v = Number(BigInt(quote.zeroExFeeAmount)) / 10 ** dec * (price as number);
+  return Number.isFinite(v) && v >= 0 ? v : null;
+}
+
 const probeDecimalsCache = new Map<string, number>();
+
+/**
+ * Router quote with a linked abort: when our timeout expires the underlying
+ * 0x request is actually cancelled instead of lingering in the background
+ * and adding load during throttled periods.
+ */
+async function routerQuote(request: QuoteRequest, side: "BUY" | "SELL", timeoutMs: number): Promise<Quote> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error("quote timeout")), timeoutMs);
+  try {
+    return await getBestExecutableQuote(request, side, ctrl.signal);
+  } catch (e) {
+    if (ctrl.signal.aborted) throw new Error("quote timeout");
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+let cachedEthBalance: { at: number; wei: bigint } | null = null;
+
+/** Cached wallet ETH balance (60s) for distinguishing sim-reverts from empty wallets. */
+async function walletEthBalanceWei(): Promise<bigint | null> {
+  try {
+    if (cachedEthBalance && Date.now() - cachedEthBalance.at < 60_000) return cachedEthBalance.wei;
+    const wei = await getEvmPublicClient().getBalance({ address: traderAddress() });
+    cachedEthBalance = { at: Date.now(), wei };
+    return wei;
+  } catch { return null; }
+}
 
 async function probeTokenDecimals(tokenAddress: string): Promise<number> {
   const key = tokenAddress.toLowerCase();
@@ -476,17 +532,17 @@ async function quoteSellExec(p: Position, pair: DexScreenerPair, soldQtyUnits: n
     let taker: string;
     try { taker = traderAddress(); } catch { await recordQuoteCheck({ ...base, source: "skipped", note: `${label}:no-trader-key` }); return fail("no-trader-key"); }
     const baseBps = config.live.sellSlippageBps;
-    const escalated = Math.min(Math.ceil(baseBps * 4 / 3), config.live.sellMaxSlippageBps);
-    const steps = escalated > baseBps ? [baseBps, escalated] : [baseBps];
+    // Same retry ladder as live (300→400→500): reuse the live helper so the
+    // policies cannot drift apart again.
+    const steps: number[] = [];
+    for (let a = 0; a < config.live.sellMaxRetries; a++) steps.push(nextSellSlippageBps(baseBps, a));
+    const uniqueSteps = [...new Set(steps)];
     let lastError = "no route";
-    for (let i = 0; i < steps.length; i++) {
-      const slip = steps[i]!;
+    for (let i = 0; i < uniqueSteps.length; i++) {
+      const slip = uniqueSteps[i]!;
       try {
         const quoteStarted = Date.now();
-        const quote = await Promise.race([
-          getBestExecutableQuote(makeQuoteRequest({ sellToken: p.tokenAddress, buyToken: NATIVE, sellAmountBaseUnits: sellRaw.toString(), slippageBps: slip, pairAddress: pair.pairAddress, taker }), "SELL"),
-          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe timeout")), config.paperExecution.quoteTimeoutMs)),
-        ]);
+        const quote = await routerQuote(makeQuoteRequest({ sellToken: p.tokenAddress, buyToken: NATIVE, sellAmountBaseUnits: sellRaw.toString(), slippageBps: slip, pairAddress: pair.pairAddress, taker }), "SELL", config.paperExecution.quoteTimeoutMs);
         const quoteLatencyMs = quote.quoteLatencyMs ?? (Date.now() - quoteStarted);
         // Simulated submit+confirm delay, then a fresh re-quote: the fill
         // uses the post-delay executable output, and fresh output below the
@@ -495,10 +551,7 @@ async function quoteSellExec(p: Position, pair: DexScreenerPair, soldQtyUnits: n
         const confirmDelay = paperLatency("confirm", config.paperExecution.confirmDelayMs);
         await sleepMs(submitDelay + confirmDelay);
         const requoteStarted = Date.now();
-        const fresh = await Promise.race([
-          getBestExecutableQuote(makeQuoteRequest({ sellToken: p.tokenAddress, buyToken: NATIVE, sellAmountBaseUnits: sellRaw.toString(), slippageBps: slip, pairAddress: pair.pairAddress, taker }), "SELL"),
-          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe requote timeout")), config.paperExecution.quoteTimeoutMs)),
-        ]);
+        const fresh = await routerQuote(makeQuoteRequest({ sellToken: p.tokenAddress, buyToken: NATIVE, sellAmountBaseUnits: sellRaw.toString(), slippageBps: slip, pairAddress: pair.pairAddress, taker }), "SELL", config.paperExecution.quoteTimeoutMs);
         const requoteLatencyMs = fresh.quoteLatencyMs ?? (Date.now() - requoteStarted);
         const simulatedLatencyMs = quoteLatencyMs + submitDelay + confirmDelay + requoteLatencyMs;
         const minBuy = BigInt(quote.minBuyAmount ?? quote.buyAmount);
@@ -507,17 +560,31 @@ async function quoteSellExec(p: Position, pair: DexScreenerPair, soldQtyUnits: n
           await recordQuoteCheck({ ...base, source: fresh.source, quotedSellAmount: fresh.sellAmount, quotedBuyAmount: fresh.buyAmount, sellDecimals: decimals, quoteLatencyMs, simulatedLatencyMs, executionOk: false, executionReason: "min-output-failed", note: `${label}@${slip} requoted below initial minBuyAmount after ${simulatedLatencyMs}ms simulated latency` });
           continue;
         }
+        // Same eth_call simulation live runs pre-submit (read-only). Sells
+        // carry no native value, so a revert here is a genuine execution
+        // refusal, not an empty-wallet artifact.
+        const sim = await simulateEvmCall({
+          from: taker as `0x${string}`, to: fresh.to as `0x${string}`,
+          data: fresh.calldata as `0x${string}`, value: BigInt(fresh.value || "0"),
+        });
+        if (!sim.ok) {
+          lastError = "simulated execution revert";
+          await recordQuoteCheck({ ...base, source: fresh.source, quotedSellAmount: fresh.sellAmount, quotedBuyAmount: fresh.buyAmount, sellDecimals: decimals, quoteLatencyMs, simulatedLatencyMs, simOk: false, executionOk: false, executionReason: "sim-revert", note: `${label}@${slip} eth_call simulation reverted: ${sim.reason?.slice(0, 120)}` });
+          continue;
+        }
         const outEth = Number(BigInt(fresh.buyAmount)) / 1e18;
         const quotedUsd = outEth * ethUsd;
         const expectedUsd = soldQtyUnits * markPrice;
         const deviation = expectedUsd > 0 ? Math.abs(quotedUsd / expectedUsd - 1) * 100 : NaN;
         await recordQuoteCheck({
           ...base, source: fresh.source, quotedSellAmount: fresh.sellAmount, quotedBuyAmount: fresh.buyAmount,
-          sellDecimals: decimals, quoteLatencyMs, simulatedLatencyMs, executionOk: true, executionReason: "live-shadow",
+          sellDecimals: decimals, quoteLatencyMs, simulatedLatencyMs, riskPass: true, simOk: true, executionOk: true, executionReason: "live-shadow",
+          quoteFeeUsd: quoteFeeValueUsd(fresh, pair, ethUsd, decimals),
           note: `${label}@${slip} quotable attempt=${i + 1} quoteLatencyMs=${quoteLatencyMs} simulatedLatencyMs=${simulatedLatencyMs}; impact=${fresh.priceImpactPct ?? "unknown"}; deviation=${Number.isFinite(deviation) ? deviation.toFixed(2) : "?"}%`,
         });
         if (!Number.isFinite(deviation) || deviation > config.safety.quoteDeviationPct) {
           lastError = `deviates ${Number.isFinite(deviation) ? deviation.toFixed(2) : "?"}%`;
+          await recordQuoteCheck({ ...base, source: fresh.source, quotedSellAmount: fresh.sellAmount, quotedBuyAmount: fresh.buyAmount, sellDecimals: decimals, quoteLatencyMs, simulatedLatencyMs, riskPass: true, simOk: true, executionOk: false, executionReason: "deviation-reject", note: `${label}@${slip} ${lastError}` });
           log(`⚠️ SELL quote deviates ${p.symbol} ${label}@${slip}: ${lastError}`);
           continue;
         }
@@ -622,70 +689,172 @@ async function fireConfirms(): Promise<void> {
 
 async function paperTick(p: Position, pair: DexScreenerPair): Promise<void> {
   const price = parsePrice(pair);
-  if (price === null) return;
+  if (price === null || p.status !== "OPEN") return;
   const now = Date.now();
   const tickLiq = pairLiquidityUsd(pair);
-  const events = updatePosition(p, price, now, tickLiq === null ? {} : { liquidityUsd: tickLiq });
+  // Decide on a clone: quantity, realized PnL, TP flags and CLOSED status
+  // change only at fill time inside the paper execution worker, so slow
+  // quote/network work never blocks this price loop (mirrors liveTick,
+  // where live sells run on the separate live-sells loop).
+  const candidate = structuredClone(p);
+  const events = updatePosition(candidate, price, now, tickLiq === null ? {} : { liquidityUsd: tickLiq });
+  p.currentPrice = candidate.currentPrice;
+  p.updatedAt = candidate.updatedAt;
+  p.highestPrice = candidate.highestPrice;
+  p.lowestPrice = candidate.lowestPrice;
+  p.highestAt = candidate.highestAt;
+  p.lowestAt = candidate.lowestAt;
+  p.trailingActive = candidate.trailingActive;
+  p.breakevenArmed = candidate.breakevenArmed;
+  if (candidate.trailHigh === undefined) delete p.trailHigh; else p.trailHigh = candidate.trailHigh;
+  if (candidate.highStreak === undefined) delete p.highStreak; else p.highStreak = candidate.highStreak;
   for (const e of events) {
-    if (e.type === "TP") {
-      const cashBefore = portfolio.cashUsd;
-      // Live-shadow exit: fill at the quoted output when routable (same
-      // router + deviation gate as liveSell); otherwise fall back to the
-      // mark fill with the pessimism stack.
-      const exec = await quoteSellExec(p, pair, e.soldQty, `TP${e.level}`, e.price).catch((err): SellExec => ({ status: "unavailable", reason: String(err).slice(0, 120) }));
-      const proceeds = exec.status === "quoted" ? exec.proceedsUsd : e.proceedsUsd;
-      const gas = exec.status === "quoted" ? exec.gasUsd : config.entry.gasPerFillUsd;
-      const exitPrice = e.soldQty > 0 ? proceeds / e.soldQty : e.price;
-      portfolio.onProceeds(proceeds);
-      applyPaperGas(p, "EXIT", gas);
-      if (exec.status !== "quoted") applyExitHaircut(p, proceeds);
-      // Quoted fills replace the mark proceeds with the executable output.
-      p.realizedPnlUsd += proceeds - e.proceedsUsd;
-      const prev = ledgerCosts.get(p.id) ?? { fee: 0, slip: 0 };
-      const feeDelta = p.totalExitFeeUsd - prev.fee;
-      const slipDelta = p.totalSlippageUsd - prev.slip;
-      ledgerCosts.set(p.id, { fee: p.totalExitFeeUsd, slip: p.totalSlippageUsd });
-      await recordFill({ time: now, side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol, tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress, quote: p.quoteSymbol, price: exitPrice, qty: e.soldQty, notionalUsd: proceeds, feeUsd: feeDelta, slipUsd: slipDelta, gasUsd: gas, detail: `TP${e.level}${exec.status === "quoted" ? ":quoted" : ""}`, balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: portfolio.equityUsd(positions.values()) });
-      await notify(buildTpMessage(p, e.level, e.gainPct, e.soldQty, proceeds, e.realizedPnlUsd + (proceeds - e.proceedsUsd) - gas, e.remainingPct, cashBefore, portfolio.cashUsd));
-    }
     if (e.type === "TRAIL_ACTIVATED") await notify(buildUpdateMessage("TRAIL", p, e.trailStop, portfolio.cashUsd));
     if (e.type === "STOP_MOVED") await notify(buildUpdateMessage("BREAKEVEN", p, e.stopPrice, portfolio.cashUsd));
-    if (isRealizedSellEvent(e) && e.type !== "TP") {
-      const cashBefore = portfolio.cashUsd;
-      let proceeds = e.proceedsUsd;
-      let exitPrice = e.price;
-      let gas = config.entry.gasPerFillUsd;
-      let quoted = false;
-      if (e.soldQty > 0) {
-        const exec = await quoteSellExec(p, pair, e.soldQty, e.type, e.price).catch((err): SellExec => ({ status: "unavailable", reason: String(err).slice(0, 120) }));
-        if (exec.status === "quoted") {
-          quoted = true;
-          proceeds = exec.proceedsUsd;
-          gas = exec.gasUsd;
-          exitPrice = proceeds / e.soldQty;
-        }
-      }
-      portfolio.onProceeds(proceeds);
-      applyPaperGas(p, "EXIT", gas);
-      if (!quoted) applyExitHaircut(p, proceeds);
-      // Quoted fills replace the mark proceeds with the executable output.
-      p.realizedPnlUsd += proceeds - e.proceedsUsd;
-      const exitLiq = pairLiquidityUsd(pair); if (exitLiq !== null) p.exitLiquidityUsd = exitLiq;
+    if (e.type === "DRAIN_EXIT" && e.soldQty <= 0) {
+      // Worthless remainder: nothing to quote, close inline at zero.
+      if (tickLiq !== null) p.exitLiquidityUsd = tickLiq;
+      closeWorthless(p, e.type, now);
+      applyPaperGas(p, "EXIT");
       p.balanceAfterUsd = portfolio.equityUsd([...positions.values()].filter((x) => x.id !== p.id));
       portfolio.onClose(p);
       positions.delete(p.id); lastSnapshotAt.delete(p.id);
       const prev = ledgerCosts.get(p.id) ?? { fee: p.totalEntryFeeUsd, slip: 0 };
       ledgerCosts.delete(p.id);
-      await recordFill({ time: now, side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol, tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress, quote: p.quoteSymbol, price: exitPrice, qty: e.soldQty, notionalUsd: proceeds, feeUsd: p.totalExitFeeUsd - prev.fee, slipUsd: p.totalSlippageUsd - prev.slip, gasUsd: gas, detail: `${e.type}${quoted ? ":quoted" : ""}`, balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: p.balanceAfterUsd ?? portfolio.cashUsd });
-      await recordTrade(tradeRecordFromPosition(p, { pnlUsd: p.realizedPnlUsd, pnlPct: p.initialUsdSize > 0 ? p.realizedPnlUsd / p.initialUsdSize * 100 : 0, balanceBeforeUsd: p.balanceBeforeUsd ?? NaN, balanceAfterUsd: p.balanceAfterUsd ?? NaN }));
+      fillModelTrack(p.id, false);
+      await recordFill({ time: now, side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol, tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress, quote: p.quoteSymbol, price: e.price, qty: 0, notionalUsd: 0, feeUsd: p.totalExitFeeUsd - prev.fee, slipUsd: p.totalSlippageUsd - prev.slip, gasUsd: config.entry.gasPerFillUsd, detail: e.type, balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: p.balanceAfterUsd ?? portfolio.cashUsd });
+      await recordTrade(tradeRecordFromPosition(p, { pnlUsd: p.realizedPnlUsd, pnlPct: p.initialUsdSize > 0 ? p.realizedPnlUsd / p.initialUsdSize * 100 : 0, balanceBeforeUsd: p.balanceBeforeUsd ?? NaN, balanceAfterUsd: p.balanceAfterUsd ?? NaN, fillModel: fillModelFor(p.id) }));
       await notify(buildCloseMessage(p, portfolio.snapshot(positions.values()), portfolio.chainStat(CHAIN), portfolio.tokenPnlUsd(CHAIN, p.symbol)));
       persist(true); break;
+    }
+    if (isRealizedSellEvent(e)) {
+      const kind = e.type === "TP" ? "TP" as const : "EXIT" as const;
+      const level = e.type === "TP" ? e.level : undefined;
+      const label = e.type === "TP" ? `TP${e.level}` : "EXIT";
+      const reason = e.type === "TP" ? `TP${e.level}` : e.type;
+      if (enqueuePaperSell({ positionId: p.id, kind, ...(level !== undefined ? { level } : {}), label, reason, qtyUnits: e.soldQty, markPrice: e.price })) log(`⏳ paper ${label} ${p.symbol} queued`);
     }
   }
   if (positions.has(p.id) && p.status === "OPEN" && now - (lastSnapshotAt.get(p.id) ?? 0) >= config.snapshots.intervalS * 1000) {
     lastSnapshotAt.set(p.id, now);
     await recordSnapshot({ time: now, positionId: p.id, chain: CHAIN, symbol: p.symbol, price, liquidityUsd: pairLiquidityUsd(pair), txnsJson: JSON.stringify(pair.txns ?? null) });
   }
+}
+
+/** Quoted-vs-mark provenance per position, for the trades fill_model flag. */
+const fillModelTrackMap = new Map<string, { quoted: number; total: number }>();
+function fillModelTrack(positionId: string, quoted: boolean): void {
+  const cur = fillModelTrackMap.get(positionId) ?? { quoted: 0, total: 0 };
+  cur.total += 1;
+  if (quoted) cur.quoted += 1;
+  fillModelTrackMap.set(positionId, cur);
+}
+function fillModelFor(positionId: string): string {
+  const cur = fillModelTrackMap.get(positionId);
+  fillModelTrackMap.delete(positionId);
+  if (!cur || cur.total === 0) return "mark";
+  if (cur.quoted === cur.total) return "quoted";
+  return cur.quoted > 0 ? "mixed" : "mark";
+}
+
+interface PendingPaperSell {
+  positionId: string;
+  kind: "TP" | "EXIT";
+  level?: number;
+  label: string;
+  reason: string;
+  qtyUnits: number;
+  markPrice: number;
+  attempts: number;
+  nextAttemptAt: number;
+}
+let paperSells: PendingPaperSell[] = [];
+let paperPumping = false;
+
+function dequeuePaperSell(positionId: string, label: string): void {
+  paperSells = paperSells.filter((q) => !(q.positionId === positionId && q.label === label));
+}
+
+function enqueuePaperSell(item: Omit<PendingPaperSell, "attempts" | "nextAttemptAt">): boolean {
+  if (paperSells.some((q) => q.positionId === item.positionId && q.label === item.label)) return false;
+  const rest = item.kind === "EXIT" ? paperSells.filter((q) => q.positionId !== item.positionId) : paperSells;
+  paperSells = [...rest, { ...item, attempts: 0, nextAttemptAt: Date.now() }];
+  return true;
+}
+
+async function executePaperSell(item: PendingPaperSell): Promise<void> {
+  const p = positions.get(item.positionId);
+  if (!p || p.status !== "OPEN") { dequeuePaperSell(item.positionId, item.label); return; }
+  const pair = await getPair(CHAIN, p.pairAddress).catch(() => null);
+  if (!pair) { item.nextAttemptAt = Date.now() + 30_000; return; }
+  const mark = parsePrice(pair);
+  if (mark === null) { item.nextAttemptAt = Date.now() + 30_000; return; }
+  const qty = Math.min(item.qtyUnits, p.quantity);
+  if (!(qty > 0)) { dequeuePaperSell(item.positionId, item.label); return; }
+  const exec = await quoteSellExec(p, pair, qty, item.label, mark).catch((err): SellExec => ({ status: "unavailable", reason: String(err).slice(0, 120) }));
+  if (exec.status !== "quoted") {
+    if (item.attempts < config.live.sellMaxRetries) {
+      item.attempts += 1;
+      item.nextAttemptAt = Date.now() + sellRetryDelayMs(item.attempts);
+      log(`⚠️ paper ${item.label} ${p.symbol} attempt ${item.attempts} unquotable (${exec.status === "balance-limited" ? "balance-limited" : exec.reason}); retrying`);
+      return;
+    }
+    log(`⚠️ paper ${item.label} ${p.symbol} unquotable after ${item.attempts} retries: mark fill with pessimism stack`);
+  }
+  const now = Date.now();
+  const cashBefore = portfolio.cashUsd;
+  const cumBefore = p.realizedPnlUsd;
+  const { qty: sold, proceedsUsd: markProceeds } = sellQuantity(p, qty, mark);
+  if (!(sold > 0)) { dequeuePaperSell(item.positionId, item.label); return; }
+  const quoted = exec.status === "quoted";
+  const proceeds = quoted ? exec.proceedsUsd : markProceeds;
+  const gas = quoted ? exec.gasUsd : config.entry.gasPerFillUsd;
+  const exitPrice = proceeds / sold;
+  portfolio.onProceeds(proceeds);
+  applyPaperGas(p, "EXIT", gas);
+  if (!quoted) applyExitHaircut(p, proceeds);
+  p.realizedPnlUsd += proceeds - markProceeds;
+  p.updatedAt = now;
+  fillModelTrack(p.id, quoted);
+  const tickLiq = pairLiquidityUsd(pair);
+  const prev = ledgerCosts.get(p.id) ?? { fee: p.totalEntryFeeUsd, slip: 0 };
+  const feeDelta = p.totalExitFeeUsd - prev.fee;
+  const slipDelta = p.totalSlippageUsd - prev.slip;
+  ledgerCosts.set(p.id, { fee: p.totalExitFeeUsd, slip: p.totalSlippageUsd });
+  const thisRealized = p.realizedPnlUsd - cumBefore;
+  const gainPct = p.entryPrice > 0 ? (exitPrice / p.entryPrice - 1) * 100 : 0;
+  if (item.kind === "TP" && item.level !== undefined && p.quantity > 0) {
+    await recordFill({ time: now, side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol, tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress, quote: p.quoteSymbol, price: exitPrice, qty: sold, notionalUsd: proceeds, feeUsd: feeDelta, slipUsd: slipDelta, gasUsd: gas, detail: `TP${item.level}${quoted ? ":quoted" : ""}`, balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: portfolio.equityUsd(positions.values()) });
+    await notify(buildTpMessage(p, item.level, gainPct, sold, proceeds, p.realizedPnlUsd, remainingPct(p), cashBefore, portfolio.cashUsd));
+    persist(true);
+    dequeuePaperSell(item.positionId, item.label);
+    return;
+  }
+  // Final exit (or a TP that consumed the remainder): close the position.
+  const reason = item.kind === "TP" ? `TP${item.level ?? ""}` : item.reason;
+  if (tickLiq !== null) p.exitLiquidityUsd = tickLiq;
+  p.status = "CLOSED";
+  p.closedReason = reason;
+  p.closedAt = now;
+  p.exitTriggerPrice = exitPrice;
+  p.balanceAfterUsd = portfolio.equityUsd([...positions.values()].filter((x) => x.id !== p.id));
+  portfolio.onClose(p);
+  positions.delete(p.id); lastSnapshotAt.delete(p.id);
+  ledgerCosts.delete(p.id);
+  await recordFill({ time: now, side: "SELL", positionId: p.id, chain: CHAIN, dex: p.dexId, symbol: p.symbol, tokenName: p.tokenName, pair: p.pairAddress, pool: p.poolAddress ?? "", ca: p.tokenAddress, quote: p.quoteSymbol, price: exitPrice, qty: sold, notionalUsd: proceeds, feeUsd: p.totalExitFeeUsd - prev.fee, slipUsd: p.totalSlippageUsd - prev.slip, gasUsd: gas, detail: `${reason}${quoted ? ":quoted" : ""}`, balanceAfterUsd: portfolio.cashUsd, equityAfterUsd: p.balanceAfterUsd ?? portfolio.cashUsd });
+  await recordTrade(tradeRecordFromPosition(p, { pnlUsd: p.realizedPnlUsd, pnlPct: p.initialUsdSize > 0 ? p.realizedPnlUsd / p.initialUsdSize * 100 : 0, balanceBeforeUsd: p.balanceBeforeUsd ?? NaN, balanceAfterUsd: p.balanceAfterUsd ?? NaN, fillModel: fillModelFor(p.id) }));
+  await notify(buildCloseMessage(p, portfolio.snapshot(positions.values()), portfolio.chainStat(CHAIN), portfolio.tokenPnlUsd(CHAIN, p.symbol)));
+  persist(true);
+  dequeuePaperSell(item.positionId, item.label);
+}
+
+async function pumpPaperSells(): Promise<void> {
+  if (config.mode !== "paper" || paperPumping) return;
+  paperPumping = true;
+  try {
+    for (const item of [...paperSells].filter((x) => x.nextAttemptAt <= Date.now())) await executePaperSell(item);
+  } catch (e) { log(`⚠️ paper-sells: ${String(e).slice(0, 160)}`); }
+  finally { paperPumping = false; }
 }
 
 async function applyLiveSellFill(
@@ -735,6 +904,7 @@ async function onLivePositionClosed(p: Position): Promise<void> {
       pnlPct: p.initialUsdSize > 0 ? p.realizedPnlUsd / p.initialUsdSize * 100 : 0,
       balanceBeforeUsd: p.balanceBeforeUsd ?? NaN,
       balanceAfterUsd: p.balanceAfterUsd ?? portfolio.cashUsd,
+      fillModel: "live",
     }));
   }
   syncLivePortfolioCash();
@@ -873,6 +1043,7 @@ async function main(): Promise<void> {
     loop("confirms", 1_000, fireConfirms),
     loop("price", config.dexScreener.intervalMs, trackPositions),
     loop("health", 10_000, health),
+    loop("paper-sells", 2_000, pumpPaperSells),
     loop("live-sells", 2_000, () => pumpLiveSells({
       log,
       notify,
