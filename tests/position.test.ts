@@ -18,6 +18,26 @@ test("early stop is tighter than initial stop", () => {
   expect(ev.some((e) => e.type === "EARLY_EXIT")).toBe(true);
 });
 
+test("flat drift exits inactive instead of riding to the time stop", () => {
+  const x = p();
+  const t26m = 1 + 26 * 60_000;
+  const ev = updatePosition(x, 105, t26m, { liquidityUsd: 20_000 });
+  expect(ev.some((e) => e.type === "INACTIVE_EXIT")).toBe(true);
+  expect(x.status).toBe("CLOSED");
+});
+
+test("inactivity exit spares TP1-banked and pre-window positions", () => {
+  const worked = p();
+  updatePosition(worked, 131, 2, { liquidityUsd: 20_000 });
+  const t26m = 1 + 26 * 60_000;
+  const evBanked = updatePosition(worked, 105, t26m, { liquidityUsd: 20_000 });
+  expect(evBanked.some((e) => e.type === "INACTIVE_EXIT")).toBe(false);
+  const fresh = p();
+  const evEarly = updatePosition(fresh, 105, 1 + 10 * 60_000, { liquidityUsd: 20_000 });
+  expect(evEarly.some((e) => e.type === "INACTIVE_EXIT")).toBe(false);
+  expect(fresh.status).toBe("OPEN");
+});
+
 
 test("same-tick TP events report their own remaining quantity and realized PnL snapshot", () => {
   const x = p();

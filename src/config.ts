@@ -84,6 +84,8 @@ const RH_EXIT: ExitProfile = {
   maxPositionAgeMin: num("MAX_POSITION_AGE_MIN", 60),
   drainLiquidityPct: num("DRAIN_LIQUIDITY_PCT", 25),
   deadLiquidityUsd: num("DEAD_LIQUIDITY_USD", 25),
+  inactiveAfterMin: num("INACTIVE_AFTER_MIN", 25),
+  inactiveMinGainPct: num("INACTIVE_MIN_GAIN_PCT", 10),
 };
 
 export const RH = {
@@ -194,6 +196,11 @@ export const config = {
     stopPct: RH_EXIT.earlyStopPct,
     windowSec: RH_EXIT.earlyStopWindowSec,
   },
+  inactive: {
+    enabled: bool("INACTIVE_EXIT_ENABLED", true),
+    afterMin: RH_EXIT.inactiveAfterMin,
+    minGainPct: RH_EXIT.inactiveMinGainPct,
+  },
   tp: RH_EXIT.tp,
   stops: {
     initialPct: RH_EXIT.initialStopPct,
@@ -211,6 +218,8 @@ export const config = {
   safety: {
     enabled: bool("TOKEN_SAFETY_ENABLED", true),
     blockRepeatSymbols: bool("TOKEN_SAFETY_BLOCK_REPEAT_SYMBOLS", true),
+    // Closed symbols free up after this many days (0 = block all history).
+    repeatBlockDays: num("TOKEN_SAFETY_REPEAT_BLOCK_DAYS", 7),
     quoteDeviationPct: num("ENTRY_QUOTE_MAX_DEVIATION_PCT", 3),
   },
   live: {
@@ -264,6 +273,8 @@ if (config.paperExecution.submitDelayMs < 0 || config.paperExecution.confirmDela
 if (config.paperExecution.latencyPercentile < 0 || config.paperExecution.latencyPercentile > 100) throw new Error("PAPER_LATENCY_PERCENTILE must be 0..100");
 if (config.paperExecution.quoteTimeoutMs <= 0) throw new Error("PAPER_QUOTE_TIMEOUT_MS must be positive");
 if (config.stops.initialPct <= config.earlyStop.stopPct || config.earlyStop.stopPct <= 0) throw new Error("Early stop must be positive and tighter than initial stop");
+if (config.inactive.afterMin <= 0 || config.inactive.afterMin >= config.entry.maxPositionAgeMin) throw new Error("INACTIVE_AFTER_MIN must be positive and shorter than MAX_POSITION_AGE_MIN");
+if (config.inactive.minGainPct < 0) throw new Error("INACTIVE_MIN_GAIN_PCT must be >= 0");
 if (config.stops.trailActivationPct <= 0 || config.stops.trailDistancePct <= 0) throw new Error("Invalid trailing stop config");
 if (config.risk.maxDailyLiveLossUsd <= 0) throw new Error("MAX_DAILY_LIVE_LOSS_USD must be positive");
 if (config.safety.quoteDeviationPct <= 0 || config.safety.quoteDeviationPct > 25) throw new Error("ENTRY_QUOTE_MAX_DEVIATION_PCT must be 0..25");
@@ -287,6 +298,7 @@ if (config.live.minEthReserveEth <= 0) throw new Error("LIVE_MIN_ETH_RESERVE mus
 }
 if (config.dynamic.breakevenBufferPct < 0 || config.dynamic.breakevenArmPct <= 0) throw new Error("Invalid breakeven config");
 if (!config.safety.enabled && config.live.enabled) throw new Error("TOKEN_SAFETY_ENABLED must stay true in live mode");
+if (!(config.safety.repeatBlockDays >= 0)) throw new Error("TOKEN_SAFETY_REPEAT_BLOCK_DAYS must be >= 0");
 if (config.live.enabled && config.mode !== "live") throw new Error("LIVE_TRADING_ENABLED=true requires MODE=live");
 if (config.live.enabled && !config.live.zeroExKey) throw new Error("LIVE_TRADING_ENABLED=true requires ZEROEX_API_KEY");
 if (config.live.enabled && !process.env.ROBINHOOD_RPC_URL) throw new Error("LIVE_TRADING_ENABLED=true requires ROBINHOOD_RPC_URL (do not use public RPC for live)");

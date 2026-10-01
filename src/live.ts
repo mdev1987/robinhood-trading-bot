@@ -35,7 +35,7 @@ interface LiveStateFile {
 }
 
 const LOCKED = new Set<LockedStatus>(["SIGNAL", "SUBMITTED", "CONFIRMED", "UNKNOWN"]);
-const EXIT_REASONS = new Set(["TRAIL_EXIT", "STOP_EXIT", "EARLY_STOP", "BREAKEVEN_STOP", "DRAIN_EXIT", "TIME_EXIT"]);
+const EXIT_REASONS = new Set(["TRAIL_EXIT", "STOP_EXIT", "EARLY_STOP", "BREAKEVEN_STOP", "DRAIN_EXIT", "INACTIVE_EXIT", "TIME_EXIT"]);
 const SELL_STEPS = [1, 4 / 3, 5 / 3] as const;
 const SELL_SWEEP_MS = 60_000;
 
@@ -223,6 +223,7 @@ function usdToEthRaw(sizeUsd: number, ethUsd: number): string {
 function reasonForEvent(type: string): string {
   if (type === "TRAIL_EXIT") return "TRAIL_EXIT";
   if (type === "TIME_EXIT") return "TIME_EXIT";
+  if (type === "INACTIVE_EXIT") return "INACTIVE_EXIT";
   if (type === "DRAIN_EXIT") return "DRAIN_EXIT";
   if (type === "EARLY_EXIT") return "EARLY_STOP";
   if (type === "BREAKEVEN_EXIT") return "BREAKEVEN_STOP";

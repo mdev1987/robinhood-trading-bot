@@ -26,6 +26,7 @@ function badge(reason?: string): string {
     case "STOP_EXIT": return "🔴 STOP EXIT";
     case "BREAKEVEN_STOP": return "🛟 BREAKEVEN EXIT";
     case "DRAIN_EXIT": return "🌊 DRAIN EXIT";
+    case "INACTIVE_EXIT": return "💤 INACTIVE EXIT";
     case "TIME_EXIT": return "⏱ TIME EXIT";
     default: return "🔴 EXIT";
   }

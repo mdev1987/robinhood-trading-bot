@@ -48,7 +48,7 @@ function sleepMs(ms: number): Promise<void> { return ms > 0 ? new Promise<void>(
 function openCount(): number { return [...positions.values()].filter((p) => p.status === "OPEN").length; }
 
 function isRealizedSellEvent(e: PositionEvent): e is Extract<PositionEvent, { soldQty: number; proceedsUsd: number }> {
-  return e.type === "TP" || e.type === "TRAIL_EXIT" || e.type === "STOP_EXIT" || e.type === "EARLY_EXIT" || e.type === "BREAKEVEN_EXIT" || e.type === "DRAIN_EXIT" || e.type === "TIME_EXIT";
+  return e.type === "TP" || e.type === "TRAIL_EXIT" || e.type === "STOP_EXIT" || e.type === "EARLY_EXIT" || e.type === "BREAKEVEN_EXIT" || e.type === "DRAIN_EXIT" || e.type === "INACTIVE_EXIT" || e.type === "TIME_EXIT";
 }
 
 /**
@@ -190,6 +190,7 @@ async function queueCandidate(candidate: Candidate): Promise<void> {
   if (config.safety.blockRepeatSymbols && isRepeatSymbol(
     [...positions.values()].filter((p) => p.status === "OPEN" && p.chain === CHAIN).map((p) => p.symbol),
     portfolio.closedTrades, CHAIN, candidate.tokenSymbol,
+    Date.now(), config.safety.repeatBlockDays,
   )) {
     log(`⏭️ skip entry ${candidate.key}: repeat symbol ${candidate.tokenSymbol} on ${CHAIN}`);
     return;

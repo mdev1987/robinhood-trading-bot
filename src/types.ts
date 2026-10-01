@@ -47,6 +47,9 @@ export interface ExitProfile {
   breakevenAfterTp1: boolean;
   earlyStopPct: number;
   earlyStopWindowSec: number;
+  /** Flat-drift exit: no TP1 and gain below this after this many minutes. */
+  inactiveAfterMin: number;
+  inactiveMinGainPct: number;
   maxPositionAgeMin: number;
   drainLiquidityPct: number;
   deadLiquidityUsd: number;

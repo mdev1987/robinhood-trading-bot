@@ -22,6 +22,7 @@ export type PositionEvent =
   | { type: "EARLY_EXIT"; price: number; soldQty: number; proceedsUsd: number; realizedPnlUsd: number; gainPct: number }
   | { type: "BREAKEVEN_EXIT"; price: number; soldQty: number; proceedsUsd: number; realizedPnlUsd: number; gainPct: number }
   | { type: "DRAIN_EXIT"; price: number; soldQty: number; proceedsUsd: number; realizedPnlUsd: number; gainPct: number }
+  | { type: "INACTIVE_EXIT"; price: number; soldQty: number; proceedsUsd: number; realizedPnlUsd: number; gainPct: number }
   | { type: "TIME_EXIT"; price: number; soldQty: number; proceedsUsd: number; realizedPnlUsd: number; gainPct: number };
 
 export interface UpdateOptions {
@@ -50,6 +51,8 @@ function exitsOf(position: Position): ExitProfile {
     maxPositionAgeMin: p?.maxPositionAgeMin ?? config.entry.maxPositionAgeMin,
     drainLiquidityPct: p?.drainLiquidityPct ?? 25,
     deadLiquidityUsd: p?.deadLiquidityUsd ?? 25,
+    inactiveAfterMin: p?.inactiveAfterMin ?? config.inactive.afterMin,
+    inactiveMinGainPct: p?.inactiveMinGainPct ?? config.inactive.minGainPct,
   };
 }
 
@@ -377,7 +380,20 @@ export function updatePosition(
   } else if (!position.trailingActive && !position.breakevenArmed && marketPrice <= initialStop) {
     position.exitTriggerPrice = initialStop;
     const { soldQty, proceedsUsd } = closePosition(position, marketPrice, "STOP_EXIT", now);
-    events.push({ type: "STOP_EXIT", price: marketPrice, soldQty, proceedsUsd, realizedPnlUsd: position.realizedPnlUsd, gainPct: gain });
+    events.push({ type: "STOP_EXIT", price: marketPrice, soldQty: soldQty, proceedsUsd, realizedPnlUsd: position.realizedPnlUsd, gainPct: gain });
+  } else if (
+    config.inactive.enabled &&
+    !position.trailingActive &&
+    !position.breakevenArmed &&
+    position.tpHit[0] !== true &&
+    now - position.openedAt >= ex.inactiveAfterMin * 60_000 &&
+    gain + EPS < ex.inactiveMinGainPct
+  ) {
+    // Flat drift: no TP1 and still below the minimum gain after the
+    // inactivity window — exit instead of riding to the 60m time stop.
+    position.exitTriggerPrice = marketPrice;
+    const { soldQty, proceedsUsd } = closePosition(position, marketPrice, "INACTIVE_EXIT", now);
+    events.push({ type: "INACTIVE_EXIT", price: marketPrice, soldQty, proceedsUsd, realizedPnlUsd: position.realizedPnlUsd, gainPct: gain });
   } else if (now - position.openedAt >= ex.maxPositionAgeMin * 60_000) {
     position.exitTriggerPrice = marketPrice;
     const { soldQty, proceedsUsd } = closePosition(position, marketPrice, "TIME_EXIT", now);

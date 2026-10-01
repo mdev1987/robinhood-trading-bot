@@ -15,21 +15,29 @@ export const BREAKER_STOP_REASONS: ReadonlySet<string> = new Set([
 /**
  * Repeat-symbol block (copycat-ticker guard): a chain+symbol seen before —
  * open or closed, any pair/CA — is one exposure. Case-insensitive.
+ * Closed trades older than `maxAgeDays` stop counting so the eligible
+ * universe does not shrink forever (observed: a permanent block decayed
+ * buys/day 83 → 16). Zero disables the time box (block all history).
  * Regression anchor: two distinct "Felis" pools must not both be entered.
  */
 export function isRepeatSymbol(
   openSymbols: Iterable<string>,
-  closedTrades: readonly { chain: string; symbol: string }[],
+  closedTrades: readonly { chain: string; symbol: string; closedAt?: number }[],
   chain: string,
   symbol: string,
+  nowMs = Date.now(),
+  maxAgeDays = Number.POSITIVE_INFINITY,
 ): boolean {
   const s = symbol.trim().toLowerCase();
   if (!s) return false;
   for (const o of openSymbols) {
     if (o.trim().toLowerCase() === s) return true;
   }
+  const cutoff = nowMs - maxAgeDays * 86_400_000;
   for (const t of closedTrades) {
-    if (t.chain === chain && t.symbol.trim().toLowerCase() === s) return true;
+    if (t.chain === chain && t.symbol.trim().toLowerCase() === s) {
+      if (t.closedAt === undefined || t.closedAt >= cutoff) return true;
+    }
   }
   return false;
 }
